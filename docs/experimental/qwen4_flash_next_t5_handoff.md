@@ -10,13 +10,14 @@ Qwen4 experimental architecture), not as Qwen3.5.
 
 ## Handoff coordinates
 
-Fill these in after the artifacts are published:
+Published artifacts and coordination:
 
 - OMLX fork/branch: `https://github.com/fuutott/omlx/tree/qwen4-flash-next-t5`
-- OMLX commit: `TBD`
+- OMLX implementation commit: `9ae674fc931070eab1c56780abaa5ccc9187273e`
 - Private Hugging Face checkpoint: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5`
 - Base checkpoint revision: `de4b8e4d43b917e7706784d8bb445c9af86a3540`
-- Published checkpoint revision: `TBD`
+- Published checkpoint revision: `7f093be9c5efbfa04f471f025c882ab0d664b42c`
+- Canonical HF coordination thread: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5/discussions/1`
 - Windows artifact: `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5`
 - Windows conversion report: `omlx_conversion.json` in the artifact
 
