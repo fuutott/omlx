@@ -139,6 +139,16 @@ array bonsai_t5_qmm(
     const array& scales,
     StreamOrDevice s = {});
 
+// Routed expert t5 projection.  This is the t5 equivalent of gather_qmm for
+// the SwitchLinear ABI and deliberately does not gather/materialise weights.
+array bonsai_t5_gather_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& indices,
+    bool sorted_indices = false,
+    StreamOrDevice s = {});
+
 std::pair<array, array> bonsai_spec_decode_verify(
     const array& draft,
     const array& target,

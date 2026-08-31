@@ -24,6 +24,7 @@ from omlx.patches import bonsai_qmv
 from omlx.patches.bonsai_t5_load import (
     _is_t5_weight_replacement,
     _patched_load_weights,
+    _t5_gather_qmm,
     _t5_quantized_matmul,
     apply_bonsai_t5_load_patch,
     free_t5_biases,
@@ -102,6 +103,17 @@ class TestIsT5WeightReplacement:
         curr = mx.zeros((4, 8), dtype=mx.uint32)
         new = mx.zeros((4, 26), dtype=mx.uint8)
         assert _is_t5_weight_replacement("proj.weight", curr, new) is True
+
+    def test_accepts_rank3_routed_expert_layout(self):
+        # E=8, N=32, K=128: SwitchLinear banks preserve both leading axes.
+        curr = mx.zeros((8, 32, 8), dtype=mx.uint32)
+        new = mx.zeros((8, 32, 26), dtype=mx.uint8)
+        assert _is_t5_weight_replacement("experts.weight", curr, new) is True
+
+    def test_rejects_rank3_leading_shape_mismatch(self):
+        curr = mx.zeros((8, 32, 8), dtype=mx.uint32)
+        new = mx.zeros((7, 32, 26), dtype=mx.uint8)
+        assert _is_t5_weight_replacement("experts.weight", curr, new) is False
 
     @pytest.mark.parametrize(
         ("key", "curr", "new"),
@@ -449,6 +461,74 @@ class TestT5QuantizedMatmulNativeRouting:
         assert called.get("bits") == 1
 
 
+class TestT5GatherQmmRouting:
+    def test_sorted_prefill_batches_contiguous_expert_runs(self, monkeypatch):
+        calls = []
+
+        def fake_qmm(x, w, scales):
+            marker = int(w[0, 0].item())
+            calls.append((x.shape[0], marker))
+            return mx.full((x.shape[0], 4), marker, dtype=x.dtype)
+
+        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmm", fake_qmm)
+        monkeypatch.setattr(
+            bonsai_t5_load,
+            "bonsai_t5_gather_qmv",
+            lambda *a, **k: pytest.fail("sorted prefill should use dense qmm"),
+        )
+        x = mx.zeros((64, 1, 64), dtype=mx.float16)
+        w = mx.stack(
+            [
+                mx.zeros((4, 13), dtype=mx.uint8),
+                mx.ones((4, 13), dtype=mx.uint8),
+            ]
+        )
+        scales = mx.ones((2, 4, 1), dtype=mx.float16)
+        biases = mx.zeros((1,), dtype=mx.float16)
+        indices = mx.concatenate(
+            [mx.zeros((32,), dtype=mx.int32), mx.ones((32,), dtype=mx.int32)]
+        )
+
+        out = _t5_gather_qmm(
+            x,
+            w,
+            scales,
+            biases,
+            rhs_indices=indices,
+            transpose=True,
+            sorted_indices=True,
+            bits=2,
+            group_size=64,
+        )
+        mx.eval(out)
+        assert calls == [(32, 0), (32, 1)]
+        assert out.shape == (64, 1, 4)
+
+    def test_unsorted_decode_routes_to_native_gather(self, monkeypatch):
+        called = {}
+
+        def fake_gather(x, w, scales, indices, *, sorted_indices):
+            called["sorted"] = sorted_indices
+            return mx.zeros((1, 1, 2, 1, 4), dtype=x.dtype)
+
+        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_gather_qmv", fake_gather)
+        x = mx.zeros((1, 1, 1, 1, 64), dtype=mx.float16)
+        w = mx.zeros((2, 4, 13), dtype=mx.uint8)
+        scales = mx.ones((2, 4, 1), dtype=mx.float16)
+        indices = mx.array([[[0, 1]]], dtype=mx.int32)
+        out = _t5_gather_qmm(
+            x,
+            w,
+            scales,
+            mx.zeros((1,), dtype=mx.float16),
+            rhs_indices=indices,
+            transpose=True,
+            sorted_indices=False,
+        )
+        assert called["sorted"] is False
+        assert out.shape == (1, 1, 2, 1, 4)
+
+
 # ---------------------------------------------------------------------------
 # apply / remove lifecycle
 # ---------------------------------------------------------------------------
@@ -458,10 +538,12 @@ class TestPatchLifecycle:
     def test_apply_installs_and_is_idempotent(self):
         orig_lw = nn.Module.load_weights
         orig_qmm = mx.quantized_matmul
+        orig_gather_qmm = mx.gather_qmm
         try:
             assert apply_bonsai_t5_load_patch() is True
             assert nn.Module.load_weights is _patched_load_weights
             assert mx.quantized_matmul is _t5_quantized_matmul
+            assert mx.gather_qmm is _t5_gather_qmm
             # Second apply is a no-op and reports it.
             assert apply_bonsai_t5_load_patch() is False
             assert nn.Module.load_weights is _patched_load_weights
@@ -469,6 +551,7 @@ class TestPatchLifecycle:
             remove_bonsai_t5_load_patch()
         assert nn.Module.load_weights is orig_lw
         assert mx.quantized_matmul is orig_qmm
+        assert mx.gather_qmm is orig_gather_qmm
 
     def test_remove_without_apply_is_noop(self):
         orig_lw = nn.Module.load_weights

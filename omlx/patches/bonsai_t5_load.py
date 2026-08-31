@@ -39,6 +39,7 @@ from omlx.custom_kernels.bonsai.fast import (
     bonsai_t5_qmv,
     bonsai_t5_qmv_wide,
     bonsai_t5_qmm,
+    bonsai_t5_gather_qmv,
     has_native,
 )
 
@@ -50,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 _original_load_weights = None
 _original_quantized_matmul = None
+_original_gather_qmm = None
 _patch_active = False
 
 
@@ -70,16 +72,16 @@ def _is_t5_weight_replacement(key: str, curr: mx.array, new: mx.array) -> bool:
         return False
     if curr.dtype != mx.uint32 or new.dtype != mx.uint8:
         return False
-    if curr.ndim != 2 or new.ndim != 2:
+    if curr.ndim < 2 or new.ndim != curr.ndim:
         return False
-    if curr.shape[0] != new.shape[0]:
+    if curr.shape[:-1] != new.shape[:-1]:
         return False
     for bpg, group_size in ((13, 64), (26, 128)):
-        if new.shape[1] % bpg != 0:
+        if new.shape[-1] % bpg != 0:
             continue
-        n_groups = new.shape[1] // bpg
+        n_groups = new.shape[-1] // bpg
         K = n_groups * group_size
-        if curr.shape[1] == K // 16:
+        if curr.shape[-1] == K // 16:
             return True
     return False
 
@@ -218,13 +220,83 @@ def _t5_quantized_matmul(
     return x @ weight_fp
 
 
+def _t5_gather_qmm(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array | None,
+    *args,
+    rhs_indices=None,
+    transpose: bool = True,
+    sorted_indices: bool = False,
+    **kwargs,
+):
+    """Intercept routed t5 weights used by QuantizedSwitchLinear."""
+    if w.dtype != mx.uint8:
+        return _original_gather_qmm(
+            x, w, scales, biases, *args,
+            rhs_indices=rhs_indices,
+            transpose=transpose,
+            sorted_indices=sorted_indices,
+            **kwargs,
+        )
+    if rhs_indices is None:
+        raise ValueError("t5 gather_qmm requires rhs_indices")
+    if not transpose:
+        raise ValueError("routed t5 experts only support transpose=True")
+    if sorted_indices and rhs_indices.size >= 64:
+        return _t5_sorted_gather_qmm(x, w, scales, rhs_indices)
+    return bonsai_t5_gather_qmv(
+        x, w, scales, rhs_indices, sorted_indices=sorted_indices
+    )
+
+
+def _t5_sorted_gather_qmm(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    indices: mx.array,
+) -> mx.array:
+    """Run one dense t5 QMM per contiguous expert run in sorted prefill.
+
+    mlx-lm's ``_gather_sort`` guarantees that equal expert ids are adjacent.
+    Reusing the dense prefill kernel amortizes each expert weight stream over
+    all tokens in its run and avoids materialising ``w[indices]``.
+    """
+    flat_indices = indices.reshape(-1)
+    mx.eval(flat_indices)
+    expert_ids = [int(value) for value in flat_indices.tolist()]
+    if not expert_ids:
+        return mx.zeros(indices.shape + (x.shape[-2], w.shape[-2]), dtype=x.dtype)
+
+    x_flat = x.reshape(-1, x.shape[-1])
+    pieces = []
+    start = 0
+    while start < len(expert_ids):
+        expert = expert_ids[start]
+        end = start + 1
+        while end < len(expert_ids) and expert_ids[end] == expert:
+            end += 1
+        pieces.append(
+            bonsai_t5_qmm(
+                x_flat[start:end],
+                w[expert],
+                scales[expert],
+            )
+        )
+        start = end
+    flat_output = pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=0)
+    return flat_output.reshape(indices.shape + (x.shape[-2], w.shape[-2]))
+
+
 def free_t5_biases(model: nn.Module) -> int:
     """Replace bias tensors in t5-format layers with tiny placeholders.
 
     t5 ternary symmetric (I-D) never uses biases at inference time — the
     dequant is ``scale * (q - 1)`` with no additive offset.  The repacked
     safetensors file carries the original 2-bit biases purely for format
-    compatibility; after loading they just waste ~420 MB of GPU memory.
+    compatibility; for Qwen3.8-Flash-Next gate/up banks they waste roughly
+    1.26 GB of unified memory after loading.
 
     This function walks every QuantizedLinear whose weight dtype is uint8
     (t5 packing) and replaces its ``biases`` parameter with a zero scalar
@@ -265,7 +337,8 @@ def apply_bonsai_t5_load_patch() -> bool:
 
     Returns True if newly applied, False if already active.
     """
-    global _original_load_weights, _original_quantized_matmul, _patch_active
+    global _original_load_weights, _original_quantized_matmul
+    global _original_gather_qmm, _patch_active
     if _patch_active:
         return False
 
@@ -275,17 +348,20 @@ def apply_bonsai_t5_load_patch() -> bool:
     import mlx.core as _mx
     _original_quantized_matmul = _mx.quantized_matmul
     _mx.quantized_matmul = _t5_quantized_matmul
+    _original_gather_qmm = _mx.gather_qmm
+    _mx.gather_qmm = _t5_gather_qmm
 
     _patch_active = True
     logger.info(
         "bonsai_t5_load: Module.load_weights and mx.quantized_matmul patched "
-        "for t5 uint8 weights."
+        "and mx.gather_qmm patched for dense and routed t5 uint8 weights."
     )
     return True
 
 
 def remove_bonsai_t5_load_patch() -> None:
-    global _original_load_weights, _original_quantized_matmul, _patch_active
+    global _original_load_weights, _original_quantized_matmul
+    global _original_gather_qmm, _patch_active
     if not _patch_active:
         return
     if _original_load_weights is not None:
@@ -295,4 +371,8 @@ def remove_bonsai_t5_load_patch() -> None:
         import mlx.core as _mx
         _mx.quantized_matmul = _original_quantized_matmul
         _original_quantized_matmul = None
+    if _original_gather_qmm is not None:
+        import mlx.core as _mx
+        _mx.gather_qmm = _original_gather_qmm
+        _original_gather_qmm = None
     _patch_active = False

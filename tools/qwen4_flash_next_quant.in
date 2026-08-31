@@ -1,0 +1,11 @@
+# Dedicated Windows/CUDA environment for quantize_qwen4_flash_next_t5.py.
+#
+# Create/update without touching global Python:
+#   uv --cache-dir .uv-cache venv .venv --python 3.12
+#   uv --cache-dir .uv-cache pip install --python .venv -r tools/qwen4_flash_next_quant.lock
+
+--extra-index-url https://download.pytorch.org/whl/cu128
+safetensors==0.7.0
+numpy==2.3.2
+packaging==25.0
+torch==2.8.0

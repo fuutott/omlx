@@ -88,6 +88,13 @@ NB_MODULE(_ext, m) {
         "stream"_a = nb::none());
 
     m.def(
+        "bonsai_t5_gather_qmv",
+        &omlx::bonsai_kernels::bonsai_t5_gather_qmv,
+        "x"_a, "w"_a, "scales"_a, "indices"_a,
+        "sorted_indices"_a = false,
+        "stream"_a = nb::none());
+
+    m.def(
         "bonsai_spec_decode_verify",
         &omlx::bonsai_kernels::bonsai_spec_decode_verify,
         "draft"_a, "target"_a,

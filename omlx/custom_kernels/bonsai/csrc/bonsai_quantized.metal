@@ -220,6 +220,60 @@ template <typename T, int group_size, int vecs_per_tg, int k_lanes>
 bonsai_qmv_fast_t5_types(64)
 bonsai_qmv_fast_t5_types(128)
 
+// Routed-expert t5 qmv.  One grid-x position is one route.  In the normal
+// SwitchGLU layout several routes share an input row; after _gather_sort each
+// route has its own row.  Pointer rebasing lets the proven dense t5 kernel do
+// the actual dot products while never constructing w[indices].
+template <typename T, int group_size>
+[[kernel]] void affine_gather_qmv_fast_t5(
+    const device uint8_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* x [[buffer(2)]],
+    const device int* indices [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& in_vec_size [[buffer(5)]],
+    const constant int& out_vec_size [[buffer(6)]],
+    const constant int& routes_per_input [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]])
+{
+    threadgroup uint t5_lut[256];
+    for (uint i = simd_lid + simd_gid * 32; i < 256; i += 128) {
+        t5_lut[i] = T5_TO_B4[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr int bytes_per_group = (group_size + 4) / 5;
+    const int n_groups = in_vec_size / group_size;
+    const int expert = indices[tid.x];
+    const int input_row = int(tid.x) / routes_per_input;
+    const device uint8_t* expert_w =
+        w + expert * out_vec_size * n_groups * bytes_per_group;
+    const device T* expert_scales =
+        scales + expert * out_vec_size * n_groups;
+    const device T* input = x + input_row * in_vec_size;
+    device T* output = y + int(tid.x) * out_vec_size;
+
+    qmv_fast_t5_impl<T, group_size, /*USE_SIGMA=*/false>(
+        expert_w, expert_scales, input, output,
+        in_vec_size, out_vec_size, nullptr, t5_lut,
+        uint3(0, tid.y, 0), simd_gid, simd_lid);
+}
+
+#define bonsai_instantiate_gather_qmv_fast_t5(type, gs)                    \
+  instantiate_kernel(                                                       \
+      "affine_gather_qmv_fast_t5_" #type "_gs_" #gs,                    \
+      affine_gather_qmv_fast_t5, type, gs)
+
+#define bonsai_gather_qmv_fast_t5_types(gs)                                \
+  bonsai_instantiate_gather_qmv_fast_t5(float, gs)                         \
+  bonsai_instantiate_gather_qmv_fast_t5(float16_t, gs)                     \
+  bonsai_instantiate_gather_qmv_fast_t5(bfloat16_t, gs)
+
+bonsai_gather_qmv_fast_t5_types(64)
+bonsai_gather_qmv_fast_t5_types(128)
+
 // qmv_wide_t5: gs=64 and gs=128
 bonsai_qmv_wide_t5_types(64)
 bonsai_qmv_wide_t5_types(128)

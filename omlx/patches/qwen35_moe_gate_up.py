@@ -100,7 +100,17 @@ def _fuse_one(switch_mlp: Any) -> None:
     if isinstance(gate, QuantizedSwitchLinear):
         fused["scales"] = mx.concatenate([gate["scales"], up["scales"]], axis=1)
         if gate.get("biases") is not None:
-            fused["biases"] = mx.concatenate([gate["biases"], up["biases"]], axis=1)
+            if gate["weight"].dtype == mx.uint8:
+                # Bonsai t5 is symmetric and its routed kernel never reads
+                # affine biases.  free_t5_biases() may already have replaced
+                # both banks with scalar placeholders; preserve that compact
+                # representation instead of concatenating along a missing
+                # expert/output axis.
+                fused["biases"] = mx.zeros((1,), dtype=gate["scales"].dtype)
+            else:
+                fused["biases"] = mx.concatenate(
+                    [gate["biases"], up["biases"]], axis=1
+                )
     if "bias" in gate:
         fused["bias"] = mx.concatenate([gate["bias"], up["bias"]], axis=-1)
     mx.eval(list(fused.values()))

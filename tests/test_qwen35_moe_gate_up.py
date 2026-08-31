@@ -183,6 +183,26 @@ def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
     assert hasattr(model.blocks[0], "gate_up_proj")
 
 
+def test_t5_fusion_keeps_scalar_ignored_bias_placeholder():
+    """free_t5_biases runs before fusion in the VLM engine."""
+    model = _make_model(
+        model_cls=_FakeQwen4Model,
+        n_blocks=1,
+        group_size=64,
+        bits=2,
+    )
+    glu = model.blocks[0]
+    for projection in (glu.gate_proj, glu.up_proj):
+        projection.weight = mx.zeros((E, INTER, 13), dtype=mx.uint8)
+        projection.biases = mx.zeros((1,), dtype=mx.bfloat16)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    fused = glu.gate_up_proj
+    assert fused.weight.shape == (E, 2 * INTER, 13)
+    assert fused.scales.shape == (E, 2 * INTER, 1)
+    assert fused.biases.shape == (1,)
+
+
 def test_env_kill_switch(monkeypatch):
     monkeypatch.setenv("OMLX_QWEN35_MOE_GATE_UP", "0")
     model = _make_model()

@@ -234,6 +234,38 @@ void dispatch_qmv_wide_t5(
     enc.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+void dispatch_gather_qmv_fast_t5(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& indices,
+    array& out,
+    int routes, int routes_per_input, int N, int K,
+    int group_size,
+    metal::Device& d,
+    const Stream& s) {
+
+    std::string kname = "affine_gather_qmv_fast_t5_"
+        + type_str(x.dtype()) + "_gs_" + std::to_string(group_size);
+    auto kernel = get_bonsai_kernel(d, kname);
+    auto& enc = metal::get_command_encoder(s);
+    enc.set_compute_pipeline_state(kernel);
+
+    int c = 0;
+    enc.set_input_array(w,       c++);
+    enc.set_input_array(scales,  c++);
+    enc.set_input_array(x,       c++);
+    enc.set_input_array(indices, c++);
+    enc.set_output_array(out,    c++);
+    enc.set_bytes(K, c++);
+    enc.set_bytes(N, c++);
+    enc.set_bytes(routes_per_input, c++);
+
+    MTL::Size group_dims(32, 4, 1);
+    MTL::Size grid_dims(routes, (N + 15) / 16, 1);
+    enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 // ---------------------------------------------------------------------------
 // qmv_fast dispatch (called from eval_gpu)
 // ---------------------------------------------------------------------------
@@ -589,6 +621,59 @@ class BonsaiT5QmmPrimitive : public Primitive {
     DEFINE_NAME(BonsaiT5QmmPrimitive)
 };
 
+class BonsaiT5GatherQmvPrimitive : public Primitive {
+ public:
+    BonsaiT5GatherQmvPrimitive(Stream s, bool sorted_indices)
+        : Primitive(s), sorted_indices_(sorted_indices) {}
+
+ private:
+    bool sorted_indices_;
+
+    void eval_cpu(
+        const std::vector<array>& /* inputs */,
+        std::vector<array>& /* outputs */) override {
+        throw std::runtime_error("BonsaiT5GatherQmvPrimitive has no CPU path.");
+    }
+
+    void eval_gpu(
+        const std::vector<array>& inputs,
+        std::vector<array>& outputs) override {
+        auto& s = stream();
+        auto& d = metal::device(s.device);
+        auto& out = outputs[0];
+        out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+
+        const auto& x       = inputs[0];
+        const auto& w       = inputs[1];
+        const auto& scales  = inputs[2];
+        const auto& indices = inputs[3];
+
+        int group_size = derive_t5_group_size(w, scales);
+        int N = static_cast<int>(w.shape(-2));
+        int K = static_cast<int>(scales.shape(-1)) * group_size;
+        int routes = static_cast<int>(indices.size());
+        int input_rows = static_cast<int>(x.size()) / K;
+        // gate/up receive one source row shared by top-k routes, while down
+        // receives one activation row per route.  Sorted prefill also has one
+        // row per route.  Infer this from cardinality instead of assuming the
+        // same layout for all three projections.
+        int routes_per_input = 1;
+        if (input_rows != routes) {
+            routes_per_input = sorted_indices_
+                ? 1 : static_cast<int>(indices.shape(-1));
+        }
+        if (routes_per_input <= 0 || routes != input_rows * routes_per_input) {
+            throw std::invalid_argument(
+                "[bonsai_t5_gather_qmv] indices are incompatible with x rows.");
+        }
+        dispatch_gather_qmv_fast_t5(
+            x, w, scales, indices, out, routes, routes_per_input,
+            N, K, group_size, d, s);
+    }
+
+    DEFINE_NAME(BonsaiT5GatherQmvPrimitive)
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -792,6 +877,35 @@ array bonsai_t5_qmm(
     return array(out_shape, x_c.dtype(),
         std::make_shared<BonsaiT5QmmPrimitive>(s),
         {x_c, w, sc});
+}
+
+array bonsai_t5_gather_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& indices,
+    bool sorted_indices,
+    StreamOrDevice s_) {
+    auto s = to_stream(s_);
+    if (w.ndim() != 3 || scales.ndim() != 3) {
+        throw std::invalid_argument(
+            "[bonsai_t5_gather_qmv] w and scales must be rank-3 expert banks.");
+    }
+    if (indices.dtype() != mlx::core::int32) {
+        throw std::invalid_argument(
+            "[bonsai_t5_gather_qmv] indices must be int32.");
+    }
+    auto x_c = ensure_row_contiguous(x, s);
+    auto sc = ensure_dtype(scales, x_c.dtype(), s);
+    auto idx = ensure_row_contiguous(indices, s);
+    int N = static_cast<int>(w.shape(-2));
+    auto out_shape = idx.shape();
+    out_shape.push_back(x_c.shape(-2));
+    out_shape.push_back(N);
+    return array(
+        out_shape, x_c.dtype(),
+        std::make_shared<BonsaiT5GatherQmvPrimitive>(s, sorted_indices),
+        {x_c, w, sc, idx});
 }
 
 std::pair<array, array> bonsai_spec_decode_verify(

@@ -467,6 +467,35 @@ def bonsai_t5_qmm(
     )
 
 
+def bonsai_t5_gather_qmv(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    indices: mx.array,
+    *,
+    sorted_indices: bool = False,
+    stream=None,
+) -> mx.array:
+    """Routed t5 expert projection without materialising selected weights.
+
+    ``w`` is ``[experts, N, packed_K]`` and ``indices`` contains the expert
+    chosen for every route.  The output shape matches ``mx.gather_qmm`` for
+    the SwitchLinear layouts used by mlx-lm/mlx-vlm.
+    """
+    if _ext is not None and has_symbol("bonsai_t5_gather_qmv"):
+        if indices.dtype != mx.int32:
+            indices = indices.astype(mx.int32)
+        return _ext.bonsai_t5_gather_qmv(
+            x, w, scales, indices,
+            sorted_indices=sorted_indices,
+            stream=stream,
+        )
+    raise RuntimeError(
+        "bonsai_t5_gather_qmv: native extension unavailable. "
+        "Rebuild the bonsai extension to run routed t5 experts."
+    )
+
+
 # ---------------------------------------------------------------------------
 # spec_decode_verify
 # ---------------------------------------------------------------------------
