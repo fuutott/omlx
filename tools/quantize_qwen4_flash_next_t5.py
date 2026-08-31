@@ -58,6 +58,39 @@ def _torch():
     return torch
 
 
+def _load_imatrix(args):
+    path = getattr(args, "imatrix", None)
+    if path is None:
+        args.imatrix_data = None
+        return None
+    try:
+        from tools.qwen4_flash_next_imatrix import GGUFImatrix
+    except ModuleNotFoundError:
+        # Direct script execution puts tools/ rather than the repository root
+        # on sys.path.
+        from qwen4_flash_next_imatrix import GGUFImatrix
+    args.imatrix_data = GGUFImatrix(path)
+    summary = args.imatrix_data.summary()
+    print(
+        f"loaded imatrix {summary['file']}: {summary['entries']} entries, "
+        f"{summary['zero_count_expert_slots']} unobserved expert slots",
+        flush=True,
+    )
+    return args.imatrix_data
+
+
+def _importance_for(args, name: str, tensor, *, projection: str | None = None):
+    matrix = getattr(args, "imatrix_data", None)
+    if matrix is None:
+        return None
+    return matrix.importance_for_hf(
+        name,
+        tuple(tensor.shape),
+        projection=projection,
+        strict=bool(getattr(args, "imatrix_strict", False)),
+    )
+
+
 def validate_config(config: dict[str, Any]) -> None:
     tc = config.get("text_config") or {}
     expected = {
@@ -144,13 +177,18 @@ def unpack_t5(packed, width: int, group_size: int = T5_GROUP_SIZE):
     return codes.reshape(*shape[:-1], width).to(torch.uint8)
 
 
-def weighted_ternary_chunk(weight, rounds: int = 8):
+def weighted_ternary_chunk(weight, rounds: int = 8, importance=None):
     """AngelSlim-style weighted LS scale with unconstrained ternary selection."""
     torch = _torch()
     original = tuple(weight.shape)
     grouped = weight.float().reshape(-1, original[-1] // T5_GROUP_SIZE, T5_GROUP_SIZE)
-    sigma2 = 2.0 * grouped.square().mean(dim=-1, keepdim=True)
-    importance = torch.sqrt(sigma2 + grouped.square())
+    if importance is None:
+        # Preserve the original weight-only recipe when no activation
+        # calibration was supplied.
+        sigma2 = 2.0 * grouped.square().mean(dim=-1, keepdim=True)
+        importance = torch.sqrt(sigma2 + grouped.square())
+    else:
+        importance = importance.float().reshape_as(grouped).clamp_min(1e-8)
     scale = grouped.abs().amax(dim=-1, keepdim=True)
     selection = torch.zeros_like(grouped)
     for _ in range(rounds):
@@ -167,7 +205,7 @@ def weighted_ternary_chunk(weight, rounds: int = 8):
     return pack_t5(codes), scale.reshape(scale_shape).to(torch.bfloat16)
 
 
-def affine_chunk(weight, bits: int, group_size: int):
+def affine_chunk(weight, bits: int, group_size: int, importance=None):
     """Torch implementation of MLX affine quantization and bit-plane packing."""
     torch = _torch()
     original = tuple(weight.shape)
@@ -182,6 +220,38 @@ def affine_chunk(weight, bits: int, group_size: int):
     q0 = torch.round(edge / scale)
     bias = torch.where(q0 != 0, edge, torch.zeros_like(edge))
     scale = torch.where(q0 != 0, edge / q0, scale)
+    if importance is not None:
+        # Port of OMLX oQe's imatrix-weighted clipping search.  The candidates
+        # preserve MLX affine semantics; only scale selection changes.
+        imp = importance.float().reshape_as(grouped).clamp_min(1e-8)
+        best_scale = scale
+        best_bias = bias
+        best_codes = torch.round((grouped - bias) / scale).clamp(0, bins)
+        best_error = (imp * (grouped - (best_codes * scale + bias)).square()).sum(
+            dim=-1, keepdim=True
+        )
+        for candidate_edge, opposite, sign in (
+            (high, low, -1.0),
+            (low, high, 1.0),
+        ):
+            raw = ((candidate_edge - opposite).abs() / bins).clamp_min(1e-7) * sign
+            q0 = torch.round(candidate_edge / raw)
+            scale0 = torch.where(q0 != 0, candidate_edge / q0, raw)
+            bias0 = torch.where(q0 != 0, candidate_edge, torch.zeros_like(candidate_edge))
+            for factor in (0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25):
+                candidate_scale = scale0 * factor
+                candidate_codes = torch.round(
+                    (grouped - bias0) / candidate_scale
+                ).clamp(0, bins)
+                error = (
+                    imp
+                    * (grouped - (candidate_codes * candidate_scale + bias0)).square()
+                ).sum(dim=-1, keepdim=True)
+                take = error < best_error
+                best_error = torch.where(take, error, best_error)
+                best_scale = torch.where(take, candidate_scale, best_scale)
+                best_bias = torch.where(take, bias0, best_bias)
+        scale, bias = best_scale, best_bias
     codes = torch.round((grouped - bias) / scale).clamp(0, bins).to(torch.int64)
 
     packed = pack_affine_codes(codes, original, bits)
@@ -226,21 +296,54 @@ def unpack_affine(packed, width: int, bits: int):
     return codes
 
 
-def quantize_chunked(weight, kind: str, bits: int, group_size: int, device: str, chunk_rows: int):
+def quantize_chunked(
+    weight,
+    kind: str,
+    bits: int,
+    group_size: int,
+    device: str,
+    chunk_rows: int,
+    importance=None,
+):
     torch = _torch()
     shape = tuple(weight.shape)
     flat = weight.reshape(-1, shape[-1])
+    importance_tensor = None
+    rows_per_expert = None
+    if importance is not None:
+        importance_tensor = torch.as_tensor(importance, dtype=torch.float32)
+        if importance_tensor.ndim == 1 and importance_tensor.shape[0] == shape[-1]:
+            pass
+        elif (
+            importance_tensor.ndim == 2
+            and len(shape) >= 3
+            and importance_tensor.shape == (shape[0], shape[-1])
+        ):
+            rows_per_expert = math.prod(shape[1:-1])
+        else:
+            raise ValueError(
+                f"importance shape {tuple(importance_tensor.shape)} is incompatible "
+                f"with weight shape {shape}"
+            )
     outputs: list[list[Any]] = [[], [], []]
     for start in range(0, flat.shape[0], chunk_rows):
         chunk = flat[start : start + chunk_rows].to(device=device, non_blocking=True)
+        chunk_importance = None
+        if importance_tensor is not None:
+            if importance_tensor.ndim == 1:
+                chunk_importance = importance_tensor.expand(chunk.shape[0], -1)
+            else:
+                expert_ids = torch.arange(start, start + chunk.shape[0]) // rows_per_expert
+                chunk_importance = importance_tensor[expert_ids]
+            chunk_importance = chunk_importance.to(device=device, non_blocking=True)
         if kind == "t5":
-            packed, scales = weighted_ternary_chunk(chunk)
+            packed, scales = weighted_ternary_chunk(chunk, importance=chunk_importance)
             result = (packed, scales, -scales)
         else:
-            result = affine_chunk(chunk, bits, group_size)
+            result = affine_chunk(chunk, bits, group_size, importance=chunk_importance)
         for target, value in zip(outputs, result):
             target.append(value.cpu())
-        del chunk, result
+        del chunk, chunk_importance, result
     joined = [torch.cat(parts, dim=0) for parts in outputs]
     packed_width = shape[-1] * bits // 32 if kind == "affine" else (shape[-1] // group_size) * ((group_size + 4) // 5)
     param_width = shape[-1] // group_size
@@ -283,11 +386,26 @@ def quant_spec(name: str, tensor) -> tuple[str, int, int] | None:
     return ("affine", BASE_QUANT["bits"], BASE_QUANT["group_size"])
 
 
-def _quantized_entries(base: str, weight, kind: str, bits: int, group_size: int, args, per_layer):
+def _quantized_entries(
+    base: str,
+    weight,
+    kind: str,
+    bits: int,
+    group_size: int,
+    args,
+    per_layer,
+    importance=None,
+):
     if weight.shape[-1] % group_size or (weight.shape[-1] * bits) % 32:
         raise ValueError(f"{base}: width {weight.shape[-1]} is incompatible with {kind} {bits}-bit/group-{group_size}")
     packed, scales, biases = quantize_chunked(
-        weight, kind, bits, group_size, args.device, args.chunk_rows
+        weight,
+        kind,
+        bits,
+        group_size,
+        args.device,
+        args.chunk_rows,
+        importance=importance,
     )
     if kind == "t5" or bits != BASE_QUANT["bits"] or group_size != BASE_QUANT["group_size"]:
         per_layer[base] = {"bits": bits, "group_size": group_size, "mode": "affine"}
@@ -308,10 +426,41 @@ def transform(name: str, tensor, args, per_layer: dict[str, dict[str, Any]]):
                 raise ValueError(f"{name}: fused gate/up row count is odd")
             gate, up = tensor.chunk(2, dim=-2)
             result = {}
-            result.update(_quantized_entries(f"{prefix}.gate_proj", gate, "t5", 2, T5_GROUP_SIZE, args, per_layer))
-            result.update(_quantized_entries(f"{prefix}.up_proj", up, "t5", 2, T5_GROUP_SIZE, args, per_layer))
+            result.update(
+                _quantized_entries(
+                    f"{prefix}.gate_proj",
+                    gate,
+                    "t5",
+                    2,
+                    T5_GROUP_SIZE,
+                    args,
+                    per_layer,
+                    importance=_importance_for(args, name, gate, projection="gate"),
+                )
+            )
+            result.update(
+                _quantized_entries(
+                    f"{prefix}.up_proj",
+                    up,
+                    "t5",
+                    2,
+                    T5_GROUP_SIZE,
+                    args,
+                    per_layer,
+                    importance=_importance_for(args, name, up, projection="up"),
+                )
+            )
             return result
-        return _quantized_entries(f"{prefix}.down_proj", tensor, "affine", 2, T5_GROUP_SIZE, args, per_layer)
+        return _quantized_entries(
+            f"{prefix}.down_proj",
+            tensor,
+            "affine",
+            2,
+            T5_GROUP_SIZE,
+            args,
+            per_layer,
+            importance=_importance_for(args, name, tensor),
+        )
 
     out_name = runtime_name(name)
     if _PLE_RE.search(name):
@@ -328,10 +477,23 @@ def transform(name: str, tensor, args, per_layer: dict[str, dict[str, Any]]):
     if tensor.shape[-1] % group_size or (tensor.shape[-1] * bits) % 32:
         # These are module layouts which mlx-vlm also leaves unquantized.
         return {out_name: tensor}
-    return _quantized_entries(module_name(out_name), tensor, kind, bits, group_size, args, per_layer)
+    return _quantized_entries(
+        module_name(out_name),
+        tensor,
+        kind,
+        bits,
+        group_size,
+        args,
+        per_layer,
+        importance=_importance_for(args, name, tensor),
+    )
 
 
-def normalize_config(config: dict[str, Any], per_layer: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def normalize_config(
+    config: dict[str, Any],
+    per_layer: dict[str, dict[str, Any]],
+    imatrix_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     output = json.loads(json.dumps(config))
     tc = output.get("text_config") or {}
     tc["mtp_num_hidden_layers"] = 0
@@ -344,9 +506,18 @@ def normalize_config(config: dict[str, Any], per_layer: dict[str, dict[str, Any]
         "format": "base3_5trits_per_byte",
         "group_size": T5_GROUP_SIZE,
         "scope": "routed gate_proj and up_proj only",
-        "calibration": "AngelSlim-inspired weighted least-squares, 8 rounds, no imatrix",
+        "calibration": (
+            "llama.cpp activation-imatrix weighted least-squares, 8 rounds"
+            if imatrix_summary is not None
+            else "AngelSlim-inspired weighted least-squares, 8 rounds, no imatrix"
+        ),
         "source": EXPECTED_REPO,
     }
+    if imatrix_summary is not None:
+        output["omlx_t5"]["importance_matrix"] = {
+            key: imatrix_summary[key]
+            for key in ("file", "bytes", "sha256", "entries")
+        }
     return output
 
 
@@ -364,6 +535,7 @@ def write_artifact_metadata(
     output: Path,
     source_shards: list[str],
     verification: dict[str, Any],
+    imatrix_summary: dict[str, Any] | None = None,
 ) -> None:
     revision = source.name if re.fullmatch(r"[0-9a-f]{40}", source.name) else None
     portable_verification = {
@@ -387,7 +559,7 @@ def write_artifact_metadata(
             "token_embedding_and_lm_head": "affine_q6_group_64",
             "default_eligible_matrix": "affine_q4_group_64",
             "mtp": "removed",
-            "importance_matrix": None,
+            "importance_matrix": imatrix_summary,
         },
         "validation_status": "structural_only_windows; Apple Silicon runtime pending",
     }
@@ -399,6 +571,17 @@ def write_artifact_metadata(
     checkpoint_gib = verification["bytes"] / 1024**3
     ple_gib = verification["ple_bytes"] / 1024**3
     mmap_gib = verification["mmap_estimate_bytes"] / 1024**3
+    if imatrix_summary is None:
+        importance_line = "- no importance matrix was used."
+        t5_line = "weighted least-squares scale"
+    else:
+        importance_line = (
+            "- activation importance: llama.cpp GGUF imatrix "
+            f"`{imatrix_summary['file']}` (`{imatrix_summary['sha256']}`), with "
+            f"{imatrix_summary['zero_count_experts_imputed']} unobserved routed "
+            "expert slots imputed from observed experts."
+        )
+        t5_line = "activation-imatrix weighted least-squares scale"
     card = f"""---
 base_model: {EXPECTED_REPO}
 library_name: mlx
@@ -431,14 +614,14 @@ ceiling. This is a header-based estimate, not a measured Mac peak.
 
 ## Precision policy
 
-- routed gate/up: Bonsai base-3 T5, group 128, weighted least-squares scale;
+- routed gate/up: Bonsai base-3 T5, group 128, {t5_line};
 - routed down: affine q2/group 128;
 - PLE n-gram embeddings: affine q2/group 32 and separately mmap-able;
 - shared experts: q8; attention/DeltaNet projections: q5;
 - token embeddings/LM head: q6; other eligible matrices: q4;
 - vision, router/state, convolution, and norm tensors: BF16;
 - MTP removed for the first memory target;
-- no importance matrix was used.
+{importance_line}
 
 The T5 representation adapts an AngelSlim-inspired weighted least-squares idea
 to OMLX's existing base-3 format. It is not the exact AngelSlim STQ1_0 3:4
@@ -624,6 +807,7 @@ def convert(args) -> None:
 
     source = args.model.resolve()
     output = args.output.resolve()
+    imatrix = _load_imatrix(args)
     if source == output:
         raise ValueError("--output must differ from --model")
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
@@ -712,13 +896,20 @@ def convert(args) -> None:
     (output / "model.safetensors.index.json").write_text(
         json.dumps(output_index, indent=2), encoding="utf-8"
     )
+    imatrix_summary = imatrix.summary() if imatrix is not None else None
     (output / "config.json").write_text(
-        json.dumps(normalize_config(config, per_layer), indent=2, ensure_ascii=False),
+        json.dumps(
+            normalize_config(config, per_layer, imatrix_summary),
+            indent=2,
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     copy_sidecars(source, output)
     verification = verify_checkpoint(output)
-    write_artifact_metadata(source, output, shards, verification)
+    write_artifact_metadata(
+        source, output, shards, verification, imatrix_summary=imatrix_summary
+    )
     print(f"complete: {output}", flush=True)
 
 
@@ -730,6 +921,7 @@ def convert_single_shard(args) -> None:
 
     source = args.single_shard.resolve()
     destination = args.output.resolve()
+    imatrix = _load_imatrix(args)
     if destination.exists() and destination.is_dir():
         destination = destination / source.name
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -747,7 +939,11 @@ def convert_single_shard(args) -> None:
     save_file(emitted, str(temporary), metadata={"format": "mlx"})
     os.replace(temporary, destination)
     validation = validate_expert_shard(
-        source, destination, args.device, args.validation_experts
+        source,
+        destination,
+        args.device,
+        args.validation_experts,
+        imatrix=imatrix,
     )
     print(
         json.dumps(
@@ -759,6 +955,7 @@ def convert_single_shard(args) -> None:
                 "seconds": round(time.monotonic() - started, 3),
                 "tensors": {key: list(value.shape) for key, value in emitted.items()},
                 "per_layer": per_layer,
+                "imatrix": imatrix.summary() if imatrix is not None else None,
                 "validation": validation,
             },
             indent=2,
@@ -767,7 +964,13 @@ def convert_single_shard(args) -> None:
     )
 
 
-def validate_expert_shard(source: Path, output: Path, device: str, sample_experts: int):
+def validate_expert_shard(
+    source: Path,
+    output: Path,
+    device: str,
+    sample_experts: int,
+    imatrix=None,
+):
     """Measure t5 error on real gate/up rows from a fused expert shard."""
     torch = _torch()
     from safetensors import safe_open
@@ -779,7 +982,9 @@ def validate_expert_shard(source: Path, output: Path, device: str, sample_expert
         if not candidates:
             return None
         raw_key = candidates[0]
-        fused = raw.get_slice(raw_key)[:sample_experts].to(device).float()
+        raw_slice = raw.get_slice(raw_key)
+        raw_shape = tuple(raw_slice.get_shape())
+        fused = raw_slice[:sample_experts].to(device).float()
     half = fused.shape[-2] // 2
     prefix_match = _EXPERT_RE.match(raw_key)
     assert prefix_match is not None
@@ -787,9 +992,9 @@ def validate_expert_shard(source: Path, output: Path, device: str, sample_expert
     prefix = f"language_model.model.layers.{layer}.mlp.switch_mlp"
     metrics = {}
     with safe_open(str(output), framework="pt", device="cpu") as quantized:
-        for projection, reference in (
-            ("gate_proj", fused[..., :half, :]),
-            ("up_proj", fused[..., half:, :]),
+        for projection, imatrix_projection, reference in (
+            ("gate_proj", "gate", fused[..., :half, :]),
+            ("up_proj", "up", fused[..., half:, :]),
         ):
             base = f"{prefix}.{projection}"
             packed = quantized.get_slice(f"{base}.weight")[:sample_experts].to(device)
@@ -824,6 +1029,62 @@ def validate_expert_shard(source: Path, output: Path, device: str, sample_expert
                     q2_reconstructed.flatten(), reference.flatten(), dim=0
                 ).item(),
             }
+            if imatrix is not None:
+                full_half_shape = (raw_shape[0], raw_shape[-2] // 2, raw_shape[-1])
+                importance = imatrix.importance_for_hf(
+                    raw_key,
+                    full_half_shape,
+                    projection=imatrix_projection,
+                    strict=True,
+                )[:sample_experts]
+                importance = torch.as_tensor(
+                    importance, dtype=torch.float32, device=device
+                )[:, None, :]
+                denominator = importance.sum() * reference.shape[-2]
+                weighted_error = (importance * error.square()).sum()
+                weighted_reference = (importance * reference.square()).sum()
+                weighted_reconstruction = (
+                    importance * reconstructed.square()
+                ).sum()
+                weighted_dot = (importance * reconstructed * reference).sum()
+                weighted_q2_error = (importance * q2_error.square()).sum()
+                weighted_q2_reconstruction = (
+                    importance * q2_reconstructed.square()
+                ).sum()
+                weighted_q2_dot = (
+                    importance * q2_reconstructed * reference
+                ).sum()
+                metrics[projection].update(
+                    {
+                        "imatrix_weighted_rmse": (
+                            weighted_error / denominator
+                        ).sqrt().item(),
+                        "imatrix_weighted_relative_rmse": (
+                            weighted_error / weighted_reference.clamp_min(1e-20)
+                        ).sqrt().item(),
+                        "imatrix_weighted_cosine": (
+                            weighted_dot
+                            / (
+                                weighted_reconstruction
+                                * weighted_reference
+                            ).clamp_min(1e-20).sqrt()
+                        ).item(),
+                        "q2_imatrix_weighted_rmse": (
+                            weighted_q2_error / denominator
+                        ).sqrt().item(),
+                        "q2_imatrix_weighted_relative_rmse": (
+                            weighted_q2_error
+                            / weighted_reference.clamp_min(1e-20)
+                        ).sqrt().item(),
+                        "q2_imatrix_weighted_cosine": (
+                            weighted_q2_dot
+                            / (
+                                weighted_q2_reconstruction
+                                * weighted_reference
+                            ).clamp_min(1e-20).sqrt()
+                        ).item(),
+                    }
+                )
     return metrics
 
 
@@ -854,6 +1115,13 @@ def self_test(device: str) -> None:
     recon = recon.reshape_as(weight)
     if not torch.isfinite(recon).all() or int(codes.min()) < 0 or int(codes.max()) > 2:
         raise AssertionError("invalid t5 round trip")
+    synthetic_importance = torch.linspace(0.1, 2.0, 256).expand(7, -1).to(device)
+    imatrix_t5, imatrix_scales = weighted_ternary_chunk(
+        weight.to(device), importance=synthetic_importance
+    )
+    imatrix_codes = unpack_t5(imatrix_t5, 256)
+    if not torch.isfinite(imatrix_scales).all() or int(imatrix_codes.max()) > 2:
+        raise AssertionError("invalid imatrix-weighted t5 round trip")
     for bits, group_size in ((2, 32), (4, 64), (5, 64), (6, 64), (8, 64)):
         packed, scale, bias = affine_chunk(weight.to(device), bits, group_size)
         codes = unpack_affine(packed, 256, bits).float()
@@ -870,6 +1138,14 @@ def self_test(device: str) -> None:
         )
         if not torch.isfinite(reconstructed).all():
             raise AssertionError(f"invalid affine q{bits} round trip")
+        weighted_packed, weighted_scale, weighted_bias = affine_chunk(
+            weight.to(device), bits, group_size, importance=synthetic_importance
+        )
+        if not all(
+            torch.isfinite(value).all()
+            for value in (weighted_scale.float(), weighted_bias.float())
+        ) or weighted_packed.shape != packed.shape:
+            raise AssertionError(f"invalid imatrix-weighted affine q{bits} result")
 
     # Miniature architecture-shaped conversion: fused expert split, routed
     # rank-3 t5 tensors, and the 160-wide PLE group-32 invariant.
@@ -920,6 +1196,16 @@ def parse_args():
     parser.add_argument("--output", type=Path, help="Destination MLX checkpoint directory")
     parser.add_argument("--single-shard", type=Path, help="Convert one shard for validation")
     parser.add_argument(
+        "--imatrix",
+        type=Path,
+        help="llama.cpp GGUF importance matrix used for activation-aware quantization",
+    )
+    parser.add_argument(
+        "--imatrix-strict",
+        action="store_true",
+        help="Fail when a mapped Qwen4 weight has no compatible imatrix entry",
+    )
+    parser.add_argument(
         "--verify-only",
         type=Path,
         help="Structurally verify an already converted checkpoint",
@@ -949,6 +1235,10 @@ def parse_args():
         parser.error("--output is required with --single-shard")
     if args.model is not None and args.output is None:
         parser.error("--output is required unless --self-test is used")
+    if args.imatrix_strict and args.imatrix is None:
+        parser.error("--imatrix-strict requires --imatrix")
+    if args.imatrix is not None and (args.self_test or args.verify_only is not None):
+        parser.error("--imatrix applies only to --model and --single-shard conversion")
     return args
 
 

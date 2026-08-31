@@ -1,7 +1,10 @@
 # Qwen3.8-Flash-Next T5 handoff
 
-Status: converted and structurally validated on Windows; not yet validated on
-Apple Silicon.
+Status: converted and structurally validated on Windows, then loaded and
+generated successfully on a 48 GB M3 Max. Importance-aware conversion support
+is implemented, and a complete imatrix-derived checkpoint has been converted
+and independently structurally verified on Windows. That second checkpoint has
+not yet been published or tested on Apple Silicon.
 
 This branch explores whether Qwen3.8-Flash-Next can run on a 48 GB M3 Max by
 combining OMLX's SSD-mmap support for Qwen4 PLE n-grams with an AngelSlim-inspired
@@ -19,6 +22,8 @@ Published artifacts and coordination:
 - Published checkpoint revision: `7f093be9c5efbfa04f471f025c882ab0d664b42c`
 - Canonical HF coordination thread: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5/discussions/1`
 - Windows artifact: `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5`
+- Windows imatrix artifact:
+  `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5-imatrix`
 - Windows conversion report: `omlx_conversion.json` in the artifact
 
 The Mac needs the modified OMLX checkout and the converted MLX checkpoint. It
@@ -57,6 +62,71 @@ the scalar ignored-bias placeholder left after T5 bias release.
 PLE n-gram tensors remain on SSD through OMLX's existing
 `DiskBackedShardedEmbedding` path. This is essential: checkpoint size is not the
 same as resident unified memory.
+
+## Importance-aware conversion follow-up
+
+The converter now accepts `--imatrix PATH` and `--imatrix-strict`. The importer
+in `tools/qwen4_flash_next_imatrix.py` memory-maps a llama.cpp/Unsloth GGUF
+importance matrix, validates `general.type=imatrix`, maps Qwen4 experimental
+tensor names, and converts accumulated squared activations into per-input
+channel energy. PLE tables are intentionally exempt because they are embedding
+lookups rather than linear activations.
+
+The tested source file has SHA-256
+`a5863123db1ca458727e738955bef7bfc199520aa2bee3a30142a1aff9254154`, 926
+entries, 144 expert entries, and 73,728 expert slots. Only 24 routed-expert
+slots had zero observations; those are imputed from the channel-wise mean of
+observed experts rather than interpreted as zero importance.
+
+The external activation energy now weights both T5 least-squares fitting and
+affine clipping search. On real source shards:
+
+- routed gate T5 weighted relative RMSE improved from 0.46508 to 0.45235;
+- routed up T5 weighted relative RMSE improved from 0.45808 to 0.44595;
+- routed down 2-bit weighted relative RMSE improved from 0.44180 to 0.38136.
+
+These are reconstruction measurements, not end-to-end KLD. Conversion without
+`--imatrix` retains the original weight-only behavior.
+
+The full strict conversion completed in 12.4 minutes on the Windows CUDA host.
+Its independent `--verify-only` pass reports 131 shards, 3,671 tensors,
+53,917,360,592 converted tensor bytes, 48 expert layers, and all 128 PLE weight
+shards. The conversion audit records 852 applied imatrix entries, zero missing
+entries, zero shape mismatches, and 24 imputed expert slots. The resulting
+checkpoint remains local until it passes Mac generation checks.
+
+## First Mac evidence
+
+The published checkpoint is live behind OMLX as
+`Qwen3.8-Flash-Next-MLX-t5`. A draft 12-prompt run with thinking enabled
+generated 2,989 completion tokens in 138.55 model-seconds (21.57 aggregate
+output tokens/s). A corrected run with thinking disabled generated 170 tokens
+in 18.8 model-seconds (9.04 aggregate output tokens/s). These short-request
+aggregate rates include prompt/first-token overhead and are not a replacement
+for a fixed-length sustained-decode benchmark.
+
+The corrected no-thinking smoke scored 8/12. One genuine miss answered `Biały`
+(white) to a Polish blue-sky question; `błękitny`/`blekitny` and grammatical
+variants are now accepted by the scorer. Two other semantic misses answered 9
+instead of 30 for modular arithmetic and Ben instead of Ava for an ordering
+question. The code-only miss returned correct code inside Markdown fences.
+
+For a base-model comparison, local LM Studio Q4_K_XL (104.53 GiB loaded) and
+Q8_0 (176.14 GiB loaded) each scored 10/12 on the same corrected corpus with
+thinking enabled. Both exhausted the 512-token budget reasoning about the
+code-only task and both answered 9 instead of 18 for `0+3+6+9`. This small
+corpus therefore does not attribute those two failures to low-bit
+quantization. OpenRouter's shared Alibaba pool was too rate-limited to produce
+a complete comparison run.
+
+The T5 inference route is native Metal, not a Python dequantization loop:
+routed gate/up uses `bonsai_t5_gather_qmv`, gate and up are fused into one
+projection, and routed down uses MLX's native affine `gather_qmm`. A current
+performance-review target is that both dense and routed T5 kernels instantiate
+`qmv_fast_t5_impl` with `USE_SIGMA=false`, so activation group sums and base-4
+pre-scaling are repeated across output tiles. Any change here must be
+benchmarked on the M3 Max; adding separate preprocessing dispatches may cost
+more than they save.
 
 ## Mac setup
 
@@ -170,9 +240,10 @@ behavior.
 The T5 gate/up representation is approximately 1.875 bits per weight on disk
 including FP16 scale and bias metadata. Runtime bias release reduces its
 resident cost. It is not AngelSlim's exact forced 3:4 STQ1_0 algorithm: the
-layout is adapted to an existing OMLX base-3 kernel, and no importance matrix is
-used in this first pass. Accordingly, do not claim “little loss” before
-generation and evaluation evidence exists.
+layout is adapted to an existing OMLX base-3 kernel. The published first pass
+did not use an importance matrix; the follow-up converter can use the Unsloth
+matrix as described above. Accordingly, do not claim “little loss” before a
+complete imatrix checkpoint has end-to-end generation and KLD evidence.
 
 ## Failure triage
 
