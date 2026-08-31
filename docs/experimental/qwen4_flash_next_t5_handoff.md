@@ -143,6 +143,21 @@ uv run pytest -q \
 The test module retains its historical Qwen3.5 name because the fusion patch is
 shared; the checkpoint and architecture validation are Qwen4-specific.
 
+## Distribution-fidelity validation
+
+No end-to-end KL divergence has been measured yet. The Windows measurements in
+this document are T5 reconstruction RMSE/cosine checks and must not be reported
+as KLD.
+
+For a meaningful result, generate teacher logits from the original checkpoint
+on Windows for a fixed multilingual/code prompt corpus, then capture logits at
+the same token positions from this exact checkpoint through the shipped MLX and
+native Bonsai Metal path on the Mac. Compute `KL(teacher || quantized)` in FP32
+and also report JS divergence, top-1 agreement, and mean/median/p95 token KLD.
+If full-vocabulary teacher logits are impractical to transfer, store top-k
+logits plus log-sum-exp/residual probability mass and label the result as an
+approximation. Record the prompt corpus and calculation code with the metrics.
+
 ## Expected constraints
 
 The converted safetensors measure 53,917,360,592 bytes (50.22 GiB). OMLX's
