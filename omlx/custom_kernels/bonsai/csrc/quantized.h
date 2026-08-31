@@ -1346,7 +1346,7 @@ constant constexpr uint T5_TO_B4[256] = {
 // qmv_fast_t5_impl — optimized (O1-O5)
 //
 // [O1] packed_uchar4 weight loads (alignment 1, 7 loads vs 26 per row-group)
-// [O2] packed_half4 activation loads (2 loads vs 5 per 5-trit byte)
+// [O2] dtype-correct activation loads (T may be float, half, or bfloat)
 // [O3] 20-trit chunk structure (4 bytes x 5 trits, fully unrolled)
 // [O4] USE_SIGMA: skip x_sum + pre-scale muls (sigma precomputed elsewhere)
 // [O5] row clamping instead of duplicated boundary loop
@@ -1416,8 +1416,11 @@ METAL_FUNC void qmv_fast_t5_impl(
         const uint p0 = lut[q0[bb]], p1 = lut[q1[bb]];
         const uint p2 = lut[q2[bb]], p3 = lut[q3[bb]];
         const int base = (c*4 + bb) * 5;
-        const packed_half4 xv4 = *((const device packed_half4*)(xg + base));
-        const U xv0 = U(xv4[0]), xv1 = U(xv4[1]), xv2 = U(xv4[2]), xv3 = U(xv4[3]);
+        // Do not reinterpret T as half here.  Qwen4Exp uses bfloat16, and
+        // reading those bits through packed_half4 silently corrupts every
+        // decode matmul while still producing finite outputs.
+        const U xv0 = U(xg[base + 0]), xv1 = U(xg[base + 1]);
+        const U xv2 = U(xg[base + 2]), xv3 = U(xg[base + 3]);
         const U xv4s = U(xg[base + 4]);
         U xp1, xp2, xp3, xp4;
         if constexpr (USE_SIGMA) { xp1=xv1; xp2=xv2; xp3=xv3; xp4=xv4s; }
@@ -1442,8 +1445,8 @@ METAL_FUNC void qmv_fast_t5_impl(
       if constexpr (tail_full > 0) {
         const uint p0=lut[t0&0xFF], p1=lut[t1&0xFF], p2=lut[t2&0xFF], p3=lut[t3&0xFF];
         const int base = chunk_bytes * 5;
-        const packed_half4 xv4 = *((const device packed_half4*)(xg + base));
-        const U xv0=U(xv4[0]), xv1=U(xv4[1]), xv2=U(xv4[2]), xv3=U(xv4[3]), xv4s=U(xg[base+4]);
+        const U xv0=U(xg[base+0]), xv1=U(xg[base+1]);
+        const U xv2=U(xg[base+2]), xv3=U(xg[base+3]), xv4s=U(xg[base+4]);
         U xp1,xp2,xp3,xp4;
         if constexpr (USE_SIGMA) { xp1=xv1;xp2=xv2;xp3=xv3;xp4=xv4s; }
         else { x_sum+=xv0+xv1+xv2+xv3+xv4s; xp1=xv1*PS1;xp2=xv2*PS2;xp3=xv3*PS3;xp4=xv4s*PS4; }

@@ -824,3 +824,58 @@ class TestT5FormatDetection:
         object.__setattr__(layer, "weight", mx.zeros((16, 3), dtype=mx.uint8))
         second = _is_t5_format(layer)
         assert first == second
+
+
+class TestT5NativeNumerics:
+    """Compare every native t5 matmul path with a decoded reference."""
+
+    @staticmethod
+    def _inputs(M: int, dtype):
+        from tools.repack_ternary_t5 import pack_t5
+
+        rng = np.random.default_rng(20260831 + M)
+        N, K, gs = 16, 128, 128
+        q = rng.integers(0, 3, size=(N, K), dtype=np.uint8)
+        scales_np = rng.uniform(0.25, 1.5, size=(N, 1)).astype(np.float32)
+        x_np = rng.standard_normal((M, K)).astype(np.float32)
+        weight_fp = (q.astype(np.float32) - 1.0) * scales_np
+        expected = x_np @ weight_fp.T
+        return (
+            mx.array(x_np).astype(dtype),
+            mx.array(pack_t5(q, gs)),
+            mx.array(scales_np).astype(dtype),
+            expected,
+        )
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    def test_qmv_matches_reference(self, dtype):
+        if not bonsai_fast.has_symbol("bonsai_t5_qmv"):
+            pytest.skip("requires compiled bonsai t5 extension")
+        x, w, scales, expected = self._inputs(1, dtype)
+        actual = bonsai_fast.bonsai_t5_qmv(x, w, scales)
+        mx.eval(actual)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)), expected, rtol=3e-2, atol=2e-1
+        )
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    def test_qmv_wide_matches_reference(self, dtype):
+        if not bonsai_fast.has_symbol("bonsai_t5_qmv_wide"):
+            pytest.skip("requires compiled bonsai t5 extension")
+        x, w, scales, expected = self._inputs(3, dtype)
+        actual = bonsai_fast.bonsai_t5_qmv_wide(x, w, scales)
+        mx.eval(actual)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)), expected, rtol=3e-2, atol=2e-1
+        )
+
+    @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+    def test_qmm_matches_reference(self, dtype):
+        if not bonsai_fast.has_symbol("bonsai_t5_qmm"):
+            pytest.skip("requires compiled bonsai t5 extension")
+        x, w, scales, expected = self._inputs(32, dtype)
+        actual = bonsai_fast.bonsai_t5_qmm(x, w, scales)
+        mx.eval(actual)
+        np.testing.assert_allclose(
+            np.array(actual.astype(mx.float32)), expected, rtol=3e-2, atol=2e-1
+        )
