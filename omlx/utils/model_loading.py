@@ -464,7 +464,12 @@ def maybe_apply_pre_load_patches(
     # wrapper chain bypasses us entirely.
     quant_cfg = config.get("quantization") or {}
     quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    if quant_bits in (1, 2):
+    t5_cfg = config.get("omlx_t5")
+    has_omlx_t5 = (
+        isinstance(t5_cfg, dict)
+        and t5_cfg.get("format") == "base3_5trits_per_byte"
+    )
+    if quant_bits in (1, 2) or has_omlx_t5:
         try:
             from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
         except Exception as e:
@@ -473,8 +478,11 @@ def maybe_apply_pre_load_patches(
             if apply_bonsai_t5_load_patch():
                 logger.info(
                     "Bonsai t5 load patch applied for %s "
-                    "(t5 uint8 weights allowed past strict shape check)",
+                    "(t5 uint8 weights allowed past strict shape check; "
+                    "base bits=%s, omlx_t5=%s)",
                     model_name,
+                    quant_bits,
+                    has_omlx_t5,
                 )
 
     # Bonsai 1-bit construction patch: stock mlx-lm calls

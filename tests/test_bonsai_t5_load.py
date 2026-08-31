@@ -19,6 +19,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import omlx.patches.bonsai_t5_load as bonsai_t5_load
+from omlx.utils import model_loading
 from omlx.custom_kernels.bonsai.fast import _dequant_1bit
 from omlx.patches import bonsai_qmv
 from omlx.patches.bonsai_t5_load import (
@@ -31,6 +32,52 @@ from omlx.patches.bonsai_t5_load import (
     remove_bonsai_t5_load_patch,
 )
 from tools.repack_ternary_t5 import pack_t5
+
+
+def _write_preload_config(tmp_path, body: str) -> str:
+    (tmp_path / "config.json").write_text(body)
+    return str(tmp_path)
+
+
+class TestT5PreLoadDispatch:
+    def test_mixed_q4_checkpoint_with_t5_marker_triggers_patch(
+        self, tmp_path, monkeypatch
+    ):
+        model_dir = _write_preload_config(
+            tmp_path,
+            '{"model_type":"llama","quantization":{"bits":4,"group_size":64},'
+            '"omlx_t5":{"format":"base3_5trits_per_byte","group_size":128}}',
+        )
+        applied = []
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setattr(
+            bonsai_t5_load,
+            "apply_bonsai_t5_load_patch",
+            lambda: applied.append(True) or True,
+        )
+
+        model_loading.maybe_apply_pre_load_patches(model_dir)
+
+        assert applied == [True]
+
+    def test_plain_q4_checkpoint_without_t5_marker_skips_patch(
+        self, tmp_path, monkeypatch
+    ):
+        model_dir = _write_preload_config(
+            tmp_path,
+            '{"model_type":"llama","quantization":{"bits":4,"group_size":64}}',
+        )
+        applied = []
+        monkeypatch.setattr(model_loading, "_patch_mlx_lm_load_config", lambda: None)
+        monkeypatch.setattr(
+            bonsai_t5_load,
+            "apply_bonsai_t5_load_patch",
+            lambda: applied.append(True) or True,
+        )
+
+        model_loading.maybe_apply_pre_load_patches(model_dir)
+
+        assert applied == []
 
 
 # ---------------------------------------------------------------------------
