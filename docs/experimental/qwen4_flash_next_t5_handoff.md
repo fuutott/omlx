@@ -25,6 +25,10 @@ The Mac needs the modified OMLX checkout and the converted MLX checkpoint. It
 does not need AngelSlim, the Windows `.model-research` directory, CUDA, PyTorch,
 or the converter environment merely to run the model.
 
+The HF thread is a user-gated mailbox. Its one-message-at-a-time read/write
+rules apply only to that discussion, not other communication. Read
+`docs/experimental/qwen4_flash_next_t5_comms.md` before accessing it.
+
 ## What changed
 
 The conversion recipe is architecture-specific and lives in

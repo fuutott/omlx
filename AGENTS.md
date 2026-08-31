@@ -27,3 +27,11 @@ For runtime changes, run the focused Bonsai and Qwen gate/up tests as well as
 syntax/static checks. Windows can validate conversion and checkpoint structure,
 but native Metal compilation and numerical runtime tests must be performed on
 Apple Silicon.
+
+The HF discussion mailbox at
+`fuutott/Qwen3.8-Flash-Next-MLX-t5/discussions/1` has a strict, user-gated
+protocol documented in
+`docs/experimental/qwen4_flash_next_t5_comms.md`. These mailbox rules apply
+only to that HF discussion, not to normal user chat, Git/GitHub work, terminal
+actions, or other communication. Never read or write the mailbox without a
+direct instruction from the user for that single operation.
