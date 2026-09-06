@@ -1,12 +1,18 @@
 # Qwen3.8-Flash-Next T5 handoff
 
-Current status (2026-09-06): the user deleted the generated models and rolled
-back the later Mac performance work. The agreed review baseline is
-`dc7aaee37066c139d58ad5540646644d36140f39`. Imatrix is parked. The next controlled
-conversion defaults to Q8 PLE ngrams, with the original weight-only expert
-recipe retained. The original BF16 source download was restarted on Windows
-at pinned revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`; no new full
-conversion has run. The Mac synthetic tests do not require that download.
+Current status (2026-09-06): generated models were deleted on Windows and the
+later Mac performance work was rolled back. The first weight-only T5 was
+reasonably coherent with factual errors (user report); T5-imatrix was unusable.
+Do not conflate them. The Mac reported still having the first weight-only
+checkpoint. The agreed review baseline is
+`dc7aaee37066c139d58ad5540646644d36140f39`. Imatrix is parked. PLE defaults to
+Q8; weight-only fitting now defaults to a guarded prefix search, with explicit
+`--t5-fitter legacy` for the original-solver control. The BF16 source download
+finished at pinned revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`; no new
+full conversion has run. The native lazy-layout fix still requires Mac testing.
+
+Read [the correctness/fitter update](qwen4_flash_next_t5_correctness_fitter.md)
+for the changes, real-weight measurements and required native validation.
 
 Read [the Q8 restart and performance plan](qwen4_flash_next_q8_restart.md) for
 current changes, validation gates, and outstanding recipe improvements. The
@@ -102,8 +108,10 @@ affine clipping search. On real source shards:
 - routed up T5 weighted relative RMSE improved from 0.45808 to 0.44595;
 - routed down 2-bit weighted relative RMSE improved from 0.44180 to 0.38136.
 
-These are reconstruction measurements, not end-to-end KLD. Conversion without
-`--imatrix` retains the original weight-only behavior.
+These are historical reconstruction measurements, not end-to-end KLD, and the
+user subsequently reported that T5-imatrix was unusable. The original
+weight-only solver is now available explicitly as `--t5-fitter legacy`;
+the default prefix solver is documented in the current update above.
 
 The full strict conversion completed in 12.4 minutes on the Windows CUDA host.
 Its independent `--verify-only` pass reports 131 shards, 3,671 tensors,

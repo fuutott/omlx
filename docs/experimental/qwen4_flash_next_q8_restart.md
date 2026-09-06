@@ -2,8 +2,15 @@
 
 We are doing quantization optimizations to run Qwen3.8-Flash-Next (`qwen4_exp`)
 on a 48 GB M3 Max. Its large PLE ngram table stays mmap-backed on SSD; routed
-experts use experimental T5 gate/up and affine Q2 down. The first model ran,
-but its quality and sustained decode performance were not established.
+experts use experimental T5 gate/up and affine Q2 down. The first weight-only
+T5 was reasonably coherent with factual errors (user report); the later
+T5-imatrix was unusable. Controlled quality and sustained decode performance
+were not established.
+
+Latest update: [runtime correctness and weight-only fitter](qwen4_flash_next_t5_correctness_fitter.md).
+That update supersedes the outstanding-fitter proposal below: prefix fitting
+is now implemented, with legacy available as an explicit A/B control. Native
+runtime verification remains pending; source download is complete.
 
 The user removed the generated checkpoints and rolled back the later Mac
 optimizations. The agreed baseline is `dc7aaee3`. Do not reapply that later work.
@@ -16,13 +23,15 @@ message, upload, download, or change to the mainline Mac installation.
 - PLE defaults to affine Q8/group-32. `--ple-bits 2` is an explicit historical
   control. Tensor names, 128 shards, T5 loader marker, and SSD detection stay
   unchanged. The runtime already infers Q8 from packed row width.
-- Non-PLE quantization is unchanged, including T5 fitting and Q2 down. QSA
+- Non-PLE precision assignments are unchanged, including Q2 down. T5 fitting
+  now defaults to guarded prefix search; use `--t5-fitter legacy` for the
+  original solver. QSA
   `self_attn.o_proj` is accurately documented as Q4 rather than the previously
   claimed Q5. This is the controlled baseline, not a finalized quality recipe.
 - Imatrix is parked behind `--allow-experimental-imatrix`. The known DeltaNet
   channel permutation and incomplete strict coverage are not fixed here.
 - Full conversion requires a fresh output directory or a matching resume
-  manifest. Identity includes converter/config/index hashes, PLE bits,
+  manifest. Identity includes converter/config/index hashes, PLE bits, T5 fitter,
   imatrix/importer hashes, source paths/sizes/mtimes, Torch version, device and chunk size. Every resumed
   shard must also have the matching embedded fingerprint. Source weight files
   are identified by stats, not full content hashes; this is an accidental-mix
@@ -45,13 +54,11 @@ rows affect SSD reads and page cache, so real process pressure still matters.
 
 ## Quality work worth doing before imatrix
 
-1. **Improve the weight-only T5 scale search.** It currently starts only from
-   each group's maximum absolute weight and can converge poorly. Compare
-   multiple starts or a sorted-threshold search, retaining the legacy result
-   as a candidate and scoring after BF16 scale rounding. Same packed format,
-   storage and inference kernel. A synthetic `[1, 0.2 x 127]` group improves
-   the existing weight-only weighted SSE from ~1.87 to ~0.66 with a better
-   scale. This demonstrates a fitter issue, not model-wide quality improvement.
+1. **Weight-only T5 scale search: implemented.** Guarded prefix search fixes
+   the maximum-initialization local minimum while retaining the original fit
+   as a candidate after BF16 rounding. Same packed format, storage and
+   inference kernel. See the current update for real-weight measurements and
+   the still-required end-to-end quality comparison.
 2. **Low-cost sensitive-matrix precision.** QSA `o_proj` Q4→Q5 adds ~22.5 MiB
    of packed weights across 12 layers. The 97 main hyperconnection input-mix
    down matrices Q4→Q8 add ~152 MiB. These are plausible protective changes,
@@ -68,7 +75,7 @@ rows affect SSD reads and page cache, so real process pressure still matters.
    teacher-forced held-out NLL or KLD when practical. Knowledge errors do not
    isolate PLE from expert damage or runtime defects.
 
-These are outstanding proposals, not changes already made to the expert recipe.
+Items 2–4 remain outstanding; only the fitter change is implemented here.
 Do not launch a full reconversion merely because the converter now defaults to
 Q8. Settle fitting/precision variants first. Download the original BF16 source
 again into explicit `HF_HOME` when authorized; do not requantize an old low-bit
@@ -88,11 +95,13 @@ Portable tests cover actual Q8/Q2 Torch packing, config/shape consistency,
 resume rejection, and mmap row assembly with uneven shards, repeated ids and
 companions in separate files. They do not execute MLX or Metal.
 
-Local result: eight portable tests passed, including the real SSD residency
+Initial Q8-only result: eight portable tests passed, including the real SSD residency
 detector on Q8 output; CUDA self-test passed; Python AST checks and
 `git diff --check` passed. The focused pytest invocation could not run in the
 Windows converter venv (pytest is not installed), and MLX/Metal numerical tests
-require the Mac regardless. No native-runtime speedup is claimed.
+require the Mac regardless. No native-runtime speedup is claimed. The newer
+correctness/fitter update records 18 passing portable/CUDA tests and the
+real-weight comparison; see its validation section for current results.
 
 ## Mac validation without touching mainline
 

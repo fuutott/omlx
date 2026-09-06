@@ -76,7 +76,10 @@ std::string type_str(Dtype dt) {
 // ---------------------------------------------------------------------------
 
 array ensure_row_contiguous(const array& x, const Stream& s) {
-    if (x.flags().row_contiguous) return x;
+    // Unevaluated broadcasts/slices can still carry provisional contiguous
+    // flags. Keep Contiguous in the lazy graph so layout is checked after its
+    // producer runs, before our kernels use flat pointer arithmetic. This is
+    // not an eval/synchronize; MLX can reuse already-contiguous buffers.
     return contiguous(x, /*allow_col_major=*/false, s);
 }
 

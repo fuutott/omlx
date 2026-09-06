@@ -35,6 +35,8 @@ class ConversionTests(unittest.TestCase):
     def test_default_and_legacy_cli(self):
         self.assertEqual(converter.parse_args(["--self-test"]).ple_bits, 8)
         self.assertEqual(converter.parse_args(["--self-test", "--ple-bits", "2"]).ple_bits, 2)
+        self.assertEqual(converter.parse_args(["--self-test"]).t5_fitter, "prefix")
+        self.assertEqual(converter.parse_args(["--self-test", "--t5-fitter", "legacy"]).t5_fitter, "legacy")
 
     def test_imatrix_requires_explicit_opt_in(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -98,7 +100,8 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(converter.prepare_output(output, identity, resume=True), fingerprint)
             with self.assertRaises(ValueError):
                 converter.prepare_output(output, identity, resume=False)
-            for field, value in (("ple_bits", 2), ("imatrix_sha256", "different"),
+            self.assertEqual(identity["t5_fitter"], "prefix")
+            for field, value in (("ple_bits", 2), ("t5_fitter", "legacy"), ("imatrix_sha256", "different"),
                                  ("converter_sha256", "different"), ("source_config_sha256", "different")):
                 with self.subTest(field=field), self.assertRaises(ValueError):
                     converter.prepare_output(output, {**identity, field: value}, resume=True)

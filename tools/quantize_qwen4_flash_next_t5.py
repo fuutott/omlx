@@ -41,6 +41,7 @@ BASE_QUANT = {"bits": 4, "group_size": 64, "mode": "affine"}
 T5_GROUP_SIZE = 128
 PLE_GROUP_SIZE = 32
 PLE_BITS = 8
+T5_FITTER = "prefix"
 _EXPERT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$")
 _PLE_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$")
 _RUNTIME_EXPERT_RE = re.compile(
@@ -83,6 +84,7 @@ def conversion_identity(source: Path, shards: list[str], args) -> dict[str, Any]
         },
         "ple_bits": args.ple_bits,
         "ple_group_size": PLE_GROUP_SIZE,
+        "t5_fitter": getattr(args, "t5_fitter", T5_FITTER),
         "imatrix_sha256": _sha256(args.imatrix) if args.imatrix else None,
         "imatrix_importer_sha256": (
             _sha256(Path(__file__).with_name("qwen4_flash_next_imatrix.py"))
@@ -235,18 +237,9 @@ def unpack_t5(packed, width: int, group_size: int = T5_GROUP_SIZE):
     return codes.reshape(*shape[:-1], width).to(torch.uint8)
 
 
-def weighted_ternary_chunk(weight, rounds: int = 8, importance=None):
-    """AngelSlim-style weighted LS scale with unconstrained ternary selection."""
+def _legacy_ternary_fit(grouped, importance, rounds):
+    """Original max-initialized alternating fit, preserved for A/B controls."""
     torch = _torch()
-    original = tuple(weight.shape)
-    grouped = weight.float().reshape(-1, original[-1] // T5_GROUP_SIZE, T5_GROUP_SIZE)
-    if importance is None:
-        # Preserve the original weight-only recipe when no activation
-        # calibration was supplied.
-        sigma2 = 2.0 * grouped.square().mean(dim=-1, keepdim=True)
-        importance = torch.sqrt(sigma2 + grouped.square())
-    else:
-        importance = importance.float().reshape_as(grouped).clamp_min(1e-8)
     scale = grouped.abs().amax(dim=-1, keepdim=True)
     selection = torch.zeros_like(grouped)
     for _ in range(rounds):
@@ -258,6 +251,74 @@ def weighted_ternary_chunk(weight, rounds: int = 8, importance=None):
         denominator = (importance * selection.square()).sum(dim=-1, keepdim=True)
         solved = (importance * selection * grouped).sum(dim=-1, keepdim=True) / denominator.clamp_min(1e-20)
         scale = torch.where(solved > 0, solved, scale)
+    return selection, scale.to(torch.bfloat16)
+
+
+def _prefix_ternary_fit(grouped, importance, legacy_selection, legacy_scale):
+    """Search magnitude prefixes; accept only a better stored-scale result.
+
+    For any positive scale, optimal nonzero codes have |w| >= scale/2,
+    irrespective of positive importance. Sort magnitudes and solve the LS
+    scale for every prefix using cumulative weighted sums. Rank candidates
+    with scales rounded to the actual BF16 storage dtype, not ideal FP32
+    scales. This avoids the legacy fit's max-initialization local minimum.
+
+    Prefix ranking uses FP32 for conversion throughput. The final comparison
+    uses direct FP64 residual sums (no cancellation-prone expanded SSE), and
+    ties retain the legacy bytes. This is a reconstruction-error safeguard,
+    not a guarantee of improved end-to-end model quality.
+    """
+    torch = _torch()
+    magnitudes, order = grouped.abs().sort(dim=-1, descending=True, stable=True)
+    sorted_importance = importance.gather(-1, order)
+    numerator = (sorted_importance * magnitudes).cumsum(dim=-1)
+    denominator = sorted_importance.cumsum(dim=-1)
+    scales = (numerator / denominator.clamp_min(1e-20)).to(torch.bfloat16).float()
+    # Maximizing reduction in SSE avoids subtracting the common total energy.
+    gain = 2 * scales * numerator - scales.square() * denominator
+    prefix = gain.argmax(dim=-1, keepdim=True)
+    scale = scales.gather(-1, prefix)
+    mask = torch.arange(T5_GROUP_SIZE, device=grouped.device) <= prefix
+    selected = torch.zeros_like(mask).scatter(-1, order, mask)
+    selection = grouped.sign() * selected
+
+    reference = grouped.double()
+    imp64 = importance.double()
+    error = (imp64 * (reference - selection.double() * scale.double()).square()).sum(dim=-1, keepdim=True)
+    legacy_error = (imp64 * (reference - legacy_selection.double() * legacy_scale.double()).square()).sum(dim=-1, keepdim=True)
+    take = torch.isfinite(error) & (error < legacy_error)
+    return (torch.where(take, selection, legacy_selection),
+            torch.where(take, scale, legacy_scale.float()).to(torch.bfloat16))
+
+
+def weighted_ternary_chunk(weight, rounds: int = 8, importance=None, *, fitter: str = T5_FITTER):
+    """Weight-only prefix LS fit, or the explicitly selected historical fit."""
+    torch = _torch()
+    if fitter not in ("legacy", "prefix"):
+        raise ValueError(f"Unknown T5 fitter: {fitter}")
+    if rounds < 1:
+        raise ValueError("T5 fitting requires at least one legacy round")
+    original = tuple(weight.shape)
+    if not original or original[-1] == 0 or original[-1] % T5_GROUP_SIZE:
+        raise ValueError("T5 weight width must be a positive multiple of 128")
+    grouped = weight.float().reshape(-1, original[-1] // T5_GROUP_SIZE, T5_GROUP_SIZE)
+    if not torch.isfinite(grouped).all():
+        raise ValueError("T5 weights must be finite")
+    if importance is None:
+        # Same objective as the first, weight-only T5; only the solver changes.
+        sigma2 = 2.0 * grouped.square().mean(dim=-1, keepdim=True)
+        importance = torch.sqrt(sigma2 + grouped.square())
+    else:
+        if fitter != "legacy":
+            raise ValueError("Prefix T5 fitting is weight-only; parked imatrix requires fitter='legacy'")
+        importance = importance.float().reshape_as(grouped).clamp_min(1e-8)
+    if not torch.isfinite(importance).all():
+        raise ValueError("T5 importance must be finite (check weight magnitude)")
+    selection, scale = _legacy_ternary_fit(grouped, importance, rounds)
+    if not torch.isfinite(scale).all():
+        raise ValueError("T5 scales are not representable as finite BF16")
+    if fitter == "prefix":
+        selection, scale = _prefix_ternary_fit(grouped, importance, selection, scale)
     codes = (selection + 1).to(torch.uint8).reshape(original)
     scale_shape = (*original[:-1], original[-1] // T5_GROUP_SIZE)
     return pack_t5(codes), scale.reshape(scale_shape).to(torch.bfloat16)
@@ -362,6 +423,7 @@ def quantize_chunked(
     device: str,
     chunk_rows: int,
     importance=None,
+    t5_fitter: str = T5_FITTER,
 ):
     torch = _torch()
     shape = tuple(weight.shape)
@@ -395,7 +457,7 @@ def quantize_chunked(
                 chunk_importance = importance_tensor[expert_ids]
             chunk_importance = chunk_importance.to(device=device, non_blocking=True)
         if kind == "t5":
-            packed, scales = weighted_ternary_chunk(chunk, importance=chunk_importance)
+            packed, scales = weighted_ternary_chunk(chunk, importance=chunk_importance, fitter=t5_fitter)
             result = (packed, scales, -scales)
         else:
             result = affine_chunk(chunk, bits, group_size, importance=chunk_importance)
@@ -464,6 +526,7 @@ def _quantized_entries(
         args.device,
         args.chunk_rows,
         importance=importance,
+        t5_fitter=getattr(args, "t5_fitter", T5_FITTER),
     )
     if kind == "t5" or bits != BASE_QUANT["bits"] or group_size != BASE_QUANT["group_size"]:
         per_layer[base] = {"bits": bits, "group_size": group_size, "mode": "affine"}
@@ -594,6 +657,7 @@ def write_artifact_metadata(
     source_shards: list[str],
     verification: dict[str, Any],
     imatrix_summary: dict[str, Any] | None = None,
+    t5_fitter: str = T5_FITTER,
 ) -> None:
     revision = source.name if re.fullmatch(r"[0-9a-f]{40}", source.name) else None
     portable_verification = {
@@ -608,7 +672,8 @@ def write_artifact_metadata(
         "converted_shard_bytes": verification["bytes"],
         "verification": portable_verification,
         "recipe": {
-            "routed_gate_up": "bonsai_t5_group_128_weighted_ls_8_rounds",
+            "routed_gate_up": f"bonsai_t5_group_128_{t5_fitter}_weighted_ls",
+            "t5_fitter": t5_fitter,
             "routed_down": "affine_q2_group_128",
             "ple_ngram_embedding": f"affine_q{verification['ple_bits']}_group_32_ssd_mmap",
             "shared_experts": "affine_q8_group_128",
@@ -631,7 +696,7 @@ def write_artifact_metadata(
     mmap_gib = verification["mmap_estimate_bytes"] / 1024**3
     if imatrix_summary is None:
         importance_line = "- no importance matrix was used."
-        t5_line = "weighted least-squares scale"
+        t5_line = f"weight-only weighted least-squares scale ({t5_fitter} fitter)"
     else:
         importance_line = (
             "- activation importance: llama.cpp GGUF imatrix "
@@ -981,7 +1046,8 @@ def convert(args) -> None:
     copy_sidecars(source, output)
     verification = verify_checkpoint(output)
     write_artifact_metadata(
-        source, output, shards, verification, imatrix_summary=imatrix_summary
+        source, output, shards, verification, imatrix_summary=imatrix_summary,
+        t5_fitter=args.t5_fitter,
     )
     print(f"complete: {output}", flush=True)
 
@@ -1030,6 +1096,7 @@ def convert_single_shard(args) -> None:
                 "seconds": round(time.monotonic() - started, 3),
                 "tensors": {key: list(value.shape) for key, value in emitted.items()},
                 "per_layer": per_layer,
+                "t5_fitter": args.t5_fitter,
                 "imatrix": imatrix.summary() if imatrix is not None else None,
                 "validation": validation,
             },
@@ -1163,7 +1230,7 @@ def validate_expert_shard(
     return metrics
 
 
-def self_test(device: str) -> None:
+def self_test(device: str, t5_fitter: str = T5_FITTER) -> None:
     torch = _torch()
     validate_config(
         {
@@ -1182,7 +1249,7 @@ def self_test(device: str) -> None:
     )
     generator = torch.Generator(device="cpu").manual_seed(7)
     weight = torch.randn((7, 256), generator=generator, dtype=torch.float32)
-    t5, scales = weighted_ternary_chunk(weight.to(device))
+    t5, scales = weighted_ternary_chunk(weight.to(device), fitter=t5_fitter)
     codes = unpack_t5(t5, 256).float()
     if not torch.equal(unpack_t5(pack_t5(codes.to(torch.uint8)), 256), codes.to(torch.uint8)):
         raise AssertionError("t5 pack/unpack changed codes")
@@ -1192,7 +1259,7 @@ def self_test(device: str) -> None:
         raise AssertionError("invalid t5 round trip")
     synthetic_importance = torch.linspace(0.1, 2.0, 256).expand(7, -1).to(device)
     imatrix_t5, imatrix_scales = weighted_ternary_chunk(
-        weight.to(device), importance=synthetic_importance
+        weight.to(device), importance=synthetic_importance, fitter="legacy"
     )
     imatrix_codes = unpack_t5(imatrix_t5, 256)
     if not torch.isfinite(imatrix_scales).all() or int(imatrix_codes.max()) > 2:
@@ -1224,7 +1291,7 @@ def self_test(device: str) -> None:
 
     # Miniature architecture-shaped conversion: fused expert split, routed
     # rank-3 t5 tensors, and the 160-wide PLE group-32 invariant.
-    test_args = SimpleNamespace(device=device, chunk_rows=8)
+    test_args = SimpleNamespace(device=device, chunk_rows=8, t5_fitter=t5_fitter)
     layer_config: dict[str, dict[str, Any]] = {}
     tiny_expert = torch.randn((2, 256, 256), generator=generator, dtype=torch.bfloat16)
     expert_out = transform(
@@ -1258,7 +1325,7 @@ def self_test(device: str) -> None:
     except ImportError as exc:
         raise AssertionError("safetensors unavailable in converter environment") from exc
     print(
-        f"self-test passed on {device}; weighted t5 RMSE={torch.mean((weight - recon.cpu()) ** 2).sqrt().item():.6f}"
+        f"self-test passed on {device}; fitter={t5_fitter}; weighted t5 RMSE={torch.mean((weight - recon.cpu()) ** 2).sqrt().item():.6f}"
     )
 
 
@@ -1272,6 +1339,8 @@ def parse_args(argv=None):
     parser.add_argument("--single-shard", type=Path, help="Convert one shard for validation")
     parser.add_argument("--ple-bits", type=int, choices=(2, 8), default=PLE_BITS,
                         help="SSD-backed ngram precision (default 8; 2 only for historical A/B controls)")
+    parser.add_argument("--t5-fitter", choices=("legacy", "prefix"), default=T5_FITTER,
+                        help="Weight-only T5 scale solver (default prefix; legacy reproduces the original fitter)")
     parser.add_argument("--allow-experimental-imatrix", action="store_true",
                         help="Explicitly opt into the parked, unvalidated imatrix experiment (known DeltaNet channel-order issue)")
     parser.add_argument(
@@ -1318,6 +1387,8 @@ def parse_args(argv=None):
         parser.error("--imatrix-strict requires --imatrix")
     if args.imatrix is not None and not args.allow_experimental_imatrix:
         parser.error("Imatrix is parked: known DeltaNet channel-order issue; experimental use requires --allow-experimental-imatrix")
+    if args.imatrix is not None and args.t5_fitter != "legacy":
+        parser.error("Prefix fitting is weight-only; experimental imatrix also requires --t5-fitter legacy")
     if args.chunk_rows <= 0 or args.validation_experts <= 0:
         parser.error("--chunk-rows and --validation-experts must be positive")
     if args.resume and args.model is None:
@@ -1330,7 +1401,7 @@ def parse_args(argv=None):
 if __name__ == "__main__":
     parsed = parse_args()
     if parsed.self_test:
-        self_test(parsed.device)
+        self_test(parsed.device, parsed.t5_fitter)
     elif parsed.verify_only is not None:
         verify_checkpoint(parsed.verify_only)
     elif parsed.single_shard is not None:
