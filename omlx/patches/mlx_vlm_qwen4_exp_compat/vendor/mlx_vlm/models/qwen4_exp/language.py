@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-import mmap
 import os
-import struct
 import weakref
 from bisect import bisect_right
 from dataclasses import dataclass, replace
@@ -28,6 +26,7 @@ from ..qwen3_5.language import (
 )
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
+from .ple_mmap import SafeTensorMMap, assemble_affine_rows, plan_rows
 from .qsa_fast import (
     contiguous_causal_gathered_qsa,
     contiguous_causal_gathered_qsa_decode,
@@ -1623,66 +1622,20 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-class _SafeTensorMMap:
+class _SafeTensorMMap(SafeTensorMMap):
     """Read selected dense or affine-packed rows without resident weights."""
 
-    def __init__(self, path: Path):
-        self.path = path
-        self._file = path.open("rb")
-        header_size = struct.unpack("<Q", self._file.read(8))[0]
-        self._header = json.loads(self._file.read(header_size))
-        self._data_start = 8 + header_size
-        self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
-        try:
-            self._mapping.madvise(mmap.MADV_RANDOM)
-        except (AttributeError, OSError):
-            pass
-
-    def tensor_shape(self, key: str) -> tuple[int, ...]:
-        return tuple(self._header[key]["shape"])
-
-    def tensor_dtype(self, key: str) -> str:
-        return str(self._header[key]["dtype"])
-
     def rows(self, key: str, rows: list[int]) -> mx.array:
-        entry = self._header[key]
-        shape = tuple(entry["shape"])
-        start, end = entry["data_offsets"]
-        dtype = entry["dtype"]
-        dtype_info = {
-            "BF16": (np.dtype("<u2"), 2),
-            "F16": (np.dtype("<f2"), 2),
-            "F32": (np.dtype("<f4"), 4),
-            "U32": (np.dtype("<u4"), 4),
-            "F8_E4M3": (np.dtype("u1"), 1),
-        }.get(dtype)
-        if dtype_info is None:
-            raise TypeError(f"SSD-backed Qwen4 PLE does not support {dtype}")
-        np_dtype, item_size = dtype_info
-        if len(shape) != 2 or end - start != math.prod(shape) * item_size:
-            raise ValueError(f"Invalid sparse PLE tensor layout for {key}")
-        view = np.ndarray(
-            shape,
-            dtype=np_dtype,
-            buffer=self._mapping,
-            offset=self._data_start + start,
-        )
-        copied = np.array(view[np.asarray(rows, dtype=np.intp)], copy=True)
+        return self.to_mlx(self.rows_numpy(key, rows), self.tensor_dtype(key))
+
+    @staticmethod
+    def to_mlx(copied: np.ndarray, dtype: str) -> mx.array:
         if dtype == "BF16":
             values = (copied.astype(np.uint32) << np.uint32(16)).view(np.float32)
             return mx.array(values).astype(mx.bfloat16)
         if dtype == "F8_E4M3":
             return mx.from_fp8(mx.array(copied), dtype=mx.bfloat16)
         return mx.array(copied)
-
-    def close(self):
-        if self._mapping is not None:
-            self._mapping.close()
-            self._mapping = None
-        if self._file is not None:
-            self._file.close()
-            self._file = None
-
 
 class DiskBackedShardedEmbedding(nn.Module):
     """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
@@ -1707,6 +1660,9 @@ class DiskBackedShardedEmbedding(nn.Module):
         self.dims = dims
         self.weight_scale = mx.ones((1,), dtype=mx.bfloat16)
         self._prefix = prefix
+        # Keep the candidate opt-in until native equality and real M3 timings
+        # pass. No global patch, row cache, or changed ngram hashing is involved.
+        self.batched_gather = os.environ.get("OMLX_QWEN4_PLE_BATCHED_GATHER", "0") == "1"
         self.rows_read = 0
         self.last_touched_shards: tuple[int, ...] = ()
         self._readers: dict[str, _SafeTensorMMap] = {}
@@ -1837,11 +1793,38 @@ class DiskBackedShardedEmbedding(nn.Module):
                 group_size,
             )
 
+        layouts = {
+            (spec[3], spec[4], *(self._tensor_readers[key].tensor_dtype(key)
+                               if key is not None else None for key in spec[:3]))
+            for spec in self._shard_specs.values()
+        }
+        self._uniform_affine = next(iter(layouts)) if len(layouts) == 1 else None
+        if self._uniform_affine is not None and self._uniform_affine[0] is None:
+            self._uniform_affine = None
+
     def __call__(self, indices: mx.array) -> mx.array:
         shape = indices.shape
         flat = indices.reshape(-1)
         mx.eval(flat)
         host_indices = [int(index) for index in flat.tolist()]
+        if self.batched_gather and self._uniform_affine is not None and host_indices:
+            plan = plan_rows(host_indices, self.shard_offsets)
+            weight, scales, biases = assemble_affine_rows(
+                plan, self._shard_specs, self._tensor_readers, len(host_indices)
+            )
+            bits, group_size, wdtype, sdtype, bdtype = self._uniform_affine
+            values = mx.dequantize(
+                _SafeTensorMMap.to_mlx(weight, wdtype),
+                _SafeTensorMMap.to_mlx(scales, sdtype),
+                _SafeTensorMMap.to_mlx(biases, bdtype),
+                group_size=group_size, bits=bits, mode="affine",
+            )
+            self.last_touched_shards = tuple(shard for shard, _, _ in plan)
+            self.rows_read = len(host_indices)
+            values = values.astype(mx.bfloat16) * self.weight_scale
+            # The reference writes each distinct output position with 0 + row.
+            # Keep that operation, including its treatment of signed zero.
+            return (mx.zeros_like(values) + values).reshape(*shape, self.dims)
         if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
             raise IndexError("embedding index is outside the sharded vocabulary")
         shard_indices = [

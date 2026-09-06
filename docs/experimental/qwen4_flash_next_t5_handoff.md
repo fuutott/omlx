@@ -1,10 +1,17 @@
 # Qwen3.8-Flash-Next T5 handoff
 
-Status: converted and structurally validated on Windows, then loaded and
-generated successfully on a 48 GB M3 Max. Importance-aware conversion support
-is implemented, and a complete imatrix-derived checkpoint has been converted
-and independently structurally verified on Windows. That second checkpoint has
-not yet been published or tested on Apple Silicon.
+Current status (2026-09-06): the user deleted the generated models and rolled
+back the later Mac performance work. The agreed review baseline is
+`dc7aaee37066c139d58ad5540646644d36140f39`. Imatrix is parked. The next controlled
+conversion defaults to Q8 PLE ngrams, with the original weight-only expert
+recipe retained. The original BF16 source download was restarted on Windows
+at pinned revision `de4b8e4d43b917e7706784d8bb445c9af86a3540`; no new full
+conversion has run. The Mac synthetic tests do not require that download.
+
+Read [the Q8 restart and performance plan](qwen4_flash_next_q8_restart.md) for
+current changes, validation gates, and outstanding recipe improvements. The
+historical artifact sizes and generation results below describe Q2 PLE models,
+not a Q8 model. Later quality/performance improvements remain unproven.
 
 This branch explores whether Qwen3.8-Flash-Next can run on a 48 GB M3 Max by
 combining OMLX's SSD-mmap support for Qwen4 PLE n-grams with an AngelSlim-inspired
@@ -16,13 +23,16 @@ Qwen4 experimental architecture), not as Qwen3.5.
 Published artifacts and coordination:
 
 - OMLX fork/branch: `https://github.com/fuutott/omlx/tree/qwen4-flash-next-t5`
-- OMLX implementation commit: `9ae674fc931070eab1c56780abaa5ccc9187273e`
+- Original OMLX implementation commit: `9ae674fc931070eab1c56780abaa5ccc9187273e`
+- Agreed code-review baseline: `dc7aaee37066c139d58ad5540646644d36140f39`
 - Private Hugging Face checkpoint: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5`
 - Base checkpoint revision: `de4b8e4d43b917e7706784d8bb445c9af86a3540`
 - Published checkpoint revision: `7f093be9c5efbfa04f471f025c882ab0d664b42c`
+- Historical `imatrix-v2` upload completed at `def75d34004cd7e229b059639209fc1bb24a792a`.
+  This is a historical record, not a fresh check of remote availability.
 - Canonical HF coordination thread: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5/discussions/1`
-- Windows artifact: `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5`
-- Windows imatrix artifact:
+- Former Windows artifact (deleted): `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5`
+- Former Windows imatrix artifact (deleted):
   `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5-imatrix`
 - Windows conversion report: `omlx_conversion.json` in the artifact
 
@@ -45,10 +55,11 @@ The current recipe is:
 
 - routed expert gate/up: Bonsai base-3 T5, group size 128;
 - routed expert down: affine 2-bit, group size 128;
-- PLE n-gram embeddings: affine 2-bit, group size 32, retained in independently
-  mmap-able shards;
+- PLE n-gram embeddings: affine 8-bit by default, group size 32, retained in
+  independently mmap-able shards (`--ple-bits 2` reproduces the historical control);
 - shared experts: affine 8-bit;
-- attention and DeltaNet projections: affine 5-bit;
+- attention and DeltaNet projections: affine 5-bit, except QSA `o_proj`, which
+  was and remains affine 4-bit in the controlled baseline;
 - token embeddings and LM head: affine 6-bit;
 - remaining eligible backbone matrices: affine 4-bit;
 - vision, routers, recurrent state, convolutions, and norms: BF16;
@@ -63,7 +74,13 @@ PLE n-gram tensors remain on SSD through OMLX's existing
 `DiskBackedShardedEmbedding` path. This is essential: checkpoint size is not the
 same as resident unified memory.
 
-## Importance-aware conversion follow-up
+## Historical importance-aware conversion follow-up (parked)
+
+The review found an unresolved GGUF/HF input-channel permutation for DeltaNet
+`out_proj`. Strict name/shape matching does not detect that issue, and unmapped
+modules are exempt from the strict check. Do not interpret the audit below as
+proof of complete/correct calibration coverage. Imatrix now requires explicit
+`--allow-experimental-imatrix`; leave it out of the Q8 baseline.
 
 The converter now accepts `--imatrix PATH` and `--imatrix-strict`. The importer
 in `tools/qwen4_flash_next_imatrix.py` memory-maps a llama.cpp/Unsloth GGUF
@@ -93,11 +110,12 @@ Its independent `--verify-only` pass reports 131 shards, 3,671 tensors,
 53,917,360,592 converted tensor bytes, 48 expert layers, and all 128 PLE weight
 shards. The conversion audit records 852 applied imatrix entries, zero missing
 entries, zero shape mismatches, and 24 imputed expert slots. The resulting
-checkpoint remains local until it passes Mac generation checks.
+checkpoint was subsequently uploaded as `imatrix-v2`. End-to-end quality and
+native numerical correctness were not established by structural verification.
 
 ## First Mac evidence
 
-The published checkpoint is live behind OMLX as
+The original checkpoint was tested behind OMLX as
 `Qwen3.8-Flash-Next-MLX-t5`. A draft 12-prompt run with thinking enabled
 generated 2,989 completion tokens in 138.55 model-seconds (21.57 aggregate
 output tokens/s). A corrected run with thinking disabled generated 170 tokens
@@ -256,5 +274,6 @@ complete imatrix checkpoint has end-to-end generation and KLD evidence.
 - Decode works but prefill fails: inspect the sorted expert-run T5 QMM route.
 - Prefill works but decode fails: inspect the native T5 gather-QMV route and the
   route-to-input cardinality calculation.
-- Grammatically fluent but factually or logically broken output: treat this as
-  quantization damage. Preserve logs and outputs before changing the recipe.
+- Grammatically fluent but factually or logically broken output: preserve logs
+  and investigate quantization, runtime numerics, prompting, and base-model
+  errors. A factual miss alone does not identify which component is responsible.

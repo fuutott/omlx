@@ -10,7 +10,7 @@ The memory-critical routed experts use two formats:
 * gate/up: weighted least-squares ternary, packed as Bonsai t5 (base-3)
 * down: ordinary MLX affine q2
 
-PLE n-gram embeddings use affine q2/group-32 and remain individually sharded,
+PLE n-gram embeddings default to affine q8/group-32 and remain individually sharded,
 which lets OMLX mmap them from SSD.  Small/sensitive language projections use
 q4-q8, vision and MoE routers stay BF16, and MTP is omitted by default.
 
@@ -22,6 +22,7 @@ the same t5 storage cost and lower reconstruction error.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -39,6 +40,7 @@ EXPECTED_REPO = "Qwen/Qwen3.8-Flash-Next"
 BASE_QUANT = {"bits": 4, "group_size": 64, "mode": "affine"}
 T5_GROUP_SIZE = 128
 PLE_GROUP_SIZE = 32
+PLE_BITS = 8
 _EXPERT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$")
 _PLE_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$")
 _RUNTIME_EXPERT_RE = re.compile(
@@ -56,6 +58,62 @@ def _torch():
     except ImportError as exc:
         raise SystemExit("PyTorch is required (use the CUDA environment on the Windows host).") from exc
     return torch
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def conversion_identity(source: Path, shards: list[str], args) -> dict[str, Any]:
+    """Bind resume to this recipe and source snapshot (stat, not weight hashes)."""
+    return {
+        "schema_version": 1,
+        "converter_sha256": _sha256(Path(__file__)),
+        "source_directory": str(source.resolve()),
+        "source_config_sha256": _sha256(source / "config.json"),
+        "source_index_sha256": _sha256(source / "model.safetensors.index.json"),
+        "source_shards_stat": {
+            name: {"bytes": (source / name).stat().st_size,
+                   "mtime_ns": (source / name).stat().st_mtime_ns}
+            for name in shards
+        },
+        "ple_bits": args.ple_bits,
+        "ple_group_size": PLE_GROUP_SIZE,
+        "imatrix_sha256": _sha256(args.imatrix) if args.imatrix else None,
+        "imatrix_importer_sha256": (
+            _sha256(Path(__file__).with_name("qwen4_flash_next_imatrix.py"))
+            if args.imatrix else None
+        ),
+        "imatrix_strict": args.imatrix_strict,
+        "torch_version": str(_torch().__version__),
+        "device": args.device,
+        "chunk_rows": args.chunk_rows,
+    }
+
+
+def prepare_output(output: Path, identity: dict[str, Any], *, resume: bool) -> str:
+    """Refuse stale/legacy output before touching any existing artifact."""
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
+    manifest = output / "omlx_conversion_manifest.json"
+    if output.exists() and any(output.iterdir()):
+        if not resume or not manifest.is_file():
+            raise ValueError("Use a fresh output directory; resume requires a matching conversion manifest")
+        if json.loads(manifest.read_text(encoding="utf-8")) != identity:
+            raise ValueError("Resume identity mismatch (source, recipe, code, or imatrix); use a fresh output directory")
+    else:
+        output.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps(identity, indent=2), encoding="utf-8")
+    return fingerprint
+
+
+def validate_resume_metadata(metadata: dict[str, str] | None, fingerprint: str) -> None:
+    if (metadata or {}).get("omlx_conversion_fingerprint") != fingerprint:
+        raise ValueError("Output shard has no matching conversion fingerprint; refusing to resume")
 
 
 def _load_imatrix(args):
@@ -464,7 +522,7 @@ def transform(name: str, tensor, args, per_layer: dict[str, dict[str, Any]]):
 
     out_name = runtime_name(name)
     if _PLE_RE.search(name):
-        return _quantized_entries(module_name(out_name), tensor, "affine", 2, PLE_GROUP_SIZE, args, per_layer)
+        return _quantized_entries(module_name(out_name), tensor, "affine", getattr(args, "ple_bits", PLE_BITS), PLE_GROUP_SIZE, args, per_layer)
 
     # qwen4_exp conv kernels use [out, kernel, in] in the MLX runtime.
     if "conv1d.weight" in out_name and tensor.shape[-1] != 1:
@@ -525,7 +583,7 @@ def copy_sidecars(source: Path, output: Path) -> None:
     for path in source.iterdir():
         if not path.is_file():
             continue
-        if path.suffix == ".safetensors" or path.name in {"model.safetensors.index.json", "config.json"}:
+        if path.suffix == ".safetensors" or path.name in {"model.safetensors.index.json", "config.json", "omlx_conversion_manifest.json", "omlx_conversion.json"}:
             continue
         shutil.copy2(path, output / path.name)
 
@@ -552,10 +610,10 @@ def write_artifact_metadata(
         "recipe": {
             "routed_gate_up": "bonsai_t5_group_128_weighted_ls_8_rounds",
             "routed_down": "affine_q2_group_128",
-            "ple_ngram_embedding": "affine_q2_group_32_ssd_mmap",
+            "ple_ngram_embedding": f"affine_q{verification['ple_bits']}_group_32_ssd_mmap",
             "shared_experts": "affine_q8_group_128",
             "shared_expert_gate": "affine_q8_group_64",
-            "attention_and_deltanet_projections": "affine_q5_group_64",
+            "attention_and_deltanet_projections": "affine_q5_group_64_except_self_attn_o_proj_q4_group_64",
             "token_embedding_and_lm_head": "affine_q6_group_64",
             "default_eligible_matrix": "affine_q4_group_64",
             "mtp": "removed",
@@ -600,7 +658,9 @@ tags:
 This is an experimental OMLX checkpoint derived from
 [{EXPECTED_REPO}](https://huggingface.co/{EXPECTED_REPO}) at `{revision_text}`.
 It targets a 48 GB M3 Max by keeping Qwen4 PLE n-gram embeddings SSD-mmaped and
-compressing routed experts below two bits per weight.
+compressing routed gate/up experts below two bits per weight. Including the
+q2 down projection and scale/bias metadata, routed experts average about two
+bits per weight on disk.
 
 This artifact has passed CUDA-side packing tests and complete structural
 checkpoint verification on Windows. It has **not yet been validated for model
@@ -616,8 +676,8 @@ ceiling. This is a header-based estimate, not a measured Mac peak.
 
 - routed gate/up: Bonsai base-3 T5, group 128, {t5_line};
 - routed down: affine q2/group 128;
-- PLE n-gram embeddings: affine q2/group 32 and separately mmap-able;
-- shared experts: q8; attention/DeltaNet projections: q5;
+- PLE n-gram embeddings: affine q{verification['ple_bits']}/group 32 and separately mmap-able;
+- shared experts: q8; attention/DeltaNet projections: q5 except QSA o_proj (q4);
 - token embeddings/LM head: q6; other eligible matrices: q4;
 - vision, router/state, convolution, and norm tensors: BF16;
 - MTP removed for the first memory target;
@@ -748,19 +808,11 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
     ple_weights = [key for key in observed if _RUNTIME_PLE_RE.search(key)]
     if len(ple_weights) != 128:
         raise ValueError(f"expected 128 PLE weight shards, found {len(ple_weights)}")
+    ple_bits_seen = set()
     for key in ple_weights:
-        base = module_name(key)
-        weight_shape, weight_dtype = tensor_meta[key]
-        if len(weight_shape) != 2 or weight_shape[-1] != 10 or weight_dtype != "U32":
-            raise ValueError(f"{key}: invalid PLE q2 weight {weight_shape}/{weight_dtype}")
-        expected_params = (weight_shape[0], 5)
-        for suffix in ("scales", "biases"):
-            companion = f"{base}.{suffix}"
-            if tensor_meta.get(companion) != (expected_params, "BF16"):
-                raise ValueError(
-                    f"{companion}: got {tensor_meta.get(companion)!r}, "
-                    f"expected {(expected_params, 'BF16')!r}"
-                )
+        ple_bits_seen.add(validate_ple_metadata(key, tensor_meta, config))
+    if len(ple_bits_seen) != 1:
+        raise ValueError("Mixed PLE bit widths are not part of this conversion recipe")
 
     dtype_bytes = {"U32": 4, "BF16": 2}
     ple_bytes = sum(
@@ -786,6 +838,7 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
         "expert_layers": 48,
         "ple_weight_shards": len(ple_weights),
         "ple_bytes": ple_bytes,
+        "ple_bits": next(iter(ple_bits_seen)),
         "mtp_tensors": 0,
         "resident_estimate_bytes": resident_estimate,
         "mmap_estimate_bytes": mmap_estimate,
@@ -795,6 +848,24 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
     }
     print(json.dumps(result, indent=2), flush=True)
     return result
+
+
+def validate_ple_metadata(key: str, tensor_meta: dict, config: dict) -> int:
+    """Check stored PLE width against its declaration, including legacy q2."""
+    base = module_name(key)
+    spec = config.get("quantization", {}).get(base, {})
+    bits = spec.get("bits")
+    if bits not in (2, 8) or spec.get("group_size") != PLE_GROUP_SIZE or spec.get("mode") != "affine":
+        raise ValueError(f"{base}: expected explicit affine q2 or q8/group-32 declaration")
+    weight_shape, weight_dtype = tensor_meta[key]
+    if len(weight_shape) != 2 or weight_shape[-1] != 160 * bits // 32 or weight_dtype != "U32":
+        raise ValueError(f"{key}: invalid PLE q{bits} weight {weight_shape}/{weight_dtype}")
+    expected_params = (weight_shape[0], 5)
+    for suffix in ("scales", "biases"):
+        companion = f"{base}.{suffix}"
+        if tensor_meta.get(companion) != (expected_params, "BF16"):
+            raise ValueError(f"{companion}: expected {expected_params}/BF16")
+    return bits
 
 
 def convert(args) -> None:
@@ -808,13 +879,14 @@ def convert(args) -> None:
     source = args.model.resolve()
     output = args.output.resolve()
     imatrix = _load_imatrix(args)
-    if source == output:
-        raise ValueError("--output must differ from --model")
+    if source == output or source in output.parents or output in source.parents:
+        raise ValueError("Source and output directories must be separate, not nested")
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
     validate_config(config)
     index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
     shards = sorted(set(index["weight_map"].values()))
-    output.mkdir(parents=True, exist_ok=True)
+    identity = conversion_identity(source, shards, args)
+    fingerprint = prepare_output(output, identity, resume=args.resume)
     per_layer: dict[str, dict[str, Any]] = {}
     weight_map: dict[str, str] = {}
     started = time.monotonic()
@@ -826,6 +898,7 @@ def convert(args) -> None:
             raise FileNotFoundError(source_shard)
         if target_shard.exists() and args.resume:
             with safe_open(str(target_shard), framework="pt", device="cpu") as existing:
+                validate_resume_metadata(existing.metadata(), fingerprint)
                 for key in existing.keys():
                     weight_map[key] = shard_name
             print(f"[{shard_number:03d}/{len(shards)}] resume {shard_name}", flush=True)
@@ -851,7 +924,7 @@ def convert(args) -> None:
                     flush=True,
                 )
         temporary = target_shard.with_suffix(target_shard.suffix + ".tmp")
-        save_file(emitted, str(temporary), metadata={"format": "mlx"})
+        save_file(emitted, str(temporary), metadata={"format": "mlx", "omlx_conversion_fingerprint": fingerprint})
         os.replace(temporary, target_shard)
         for key in emitted:
             weight_map[key] = shard_name
@@ -872,7 +945,7 @@ def convert(args) -> None:
             elif base.endswith("down_proj"):
                 per_layer[base] = {"bits": 2, "group_size": T5_GROUP_SIZE, "mode": "affine"}
         if ".ngram_embedding.shards." in key and key.endswith(".weight"):
-            per_layer[module_name(key)] = {"bits": 2, "group_size": PLE_GROUP_SIZE, "mode": "affine"}
+            per_layer[module_name(key)] = {"bits": args.ple_bits, "group_size": PLE_GROUP_SIZE, "mode": "affine"}
             continue
         if ".switch_mlp." in key:
             continue
@@ -924,6 +997,8 @@ def convert_single_shard(args) -> None:
     imatrix = _load_imatrix(args)
     if destination.exists() and destination.is_dir():
         destination = destination / source.name
+    if destination.exists():
+        raise ValueError("Single-shard output already exists; use a fresh destination")
     destination.parent.mkdir(parents=True, exist_ok=True)
     per_layer: dict[str, dict[str, Any]] = {}
     emitted = {}
@@ -1122,7 +1197,7 @@ def self_test(device: str) -> None:
     imatrix_codes = unpack_t5(imatrix_t5, 256)
     if not torch.isfinite(imatrix_scales).all() or int(imatrix_codes.max()) > 2:
         raise AssertionError("invalid imatrix-weighted t5 round trip")
-    for bits, group_size in ((2, 32), (4, 64), (5, 64), (6, 64), (8, 64)):
+    for bits, group_size in ((2, 32), (4, 64), (5, 64), (6, 64), (8, 64), (8, 32)):
         packed, scale, bias = affine_chunk(weight.to(device), bits, group_size)
         codes = unpack_affine(packed, 256, bits).float()
         known_codes = torch.randint(
@@ -1169,8 +1244,8 @@ def self_test(device: str) -> None:
         layer_config,
     )
     ple_key = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight"
-    if ple_out[ple_key].shape != (3, 10) or ple_out[ple_key].dtype != torch.uint32:
-        raise AssertionError("PLE q2/group-32 shape/dtype mismatch")
+    if ple_out[ple_key].shape != (3, 40) or ple_out[ple_key].dtype != torch.uint32:
+        raise AssertionError("PLE q8/group-32 shape/dtype mismatch")
     try:
         from safetensors import safe_open
         from safetensors.torch import save_file
@@ -1187,7 +1262,7 @@ def self_test(device: str) -> None:
     )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -1195,6 +1270,10 @@ def parse_args():
     parser.add_argument("--model", type=Path, help="Downloaded Qwen/Qwen3.8-Flash-Next directory")
     parser.add_argument("--output", type=Path, help="Destination MLX checkpoint directory")
     parser.add_argument("--single-shard", type=Path, help="Convert one shard for validation")
+    parser.add_argument("--ple-bits", type=int, choices=(2, 8), default=PLE_BITS,
+                        help="SSD-backed ngram precision (default 8; 2 only for historical A/B controls)")
+    parser.add_argument("--allow-experimental-imatrix", action="store_true",
+                        help="Explicitly opt into the parked, unvalidated imatrix experiment (known DeltaNet channel-order issue)")
     parser.add_argument(
         "--imatrix",
         type=Path,
@@ -1220,7 +1299,7 @@ def parse_args():
     )
     parser.add_argument("--resume", action="store_true", help="Keep completed output shards")
     parser.add_argument("--self-test", action="store_true", help="Test pack/dequant kernels without a model")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     modes = sum(
         (
             bool(args.self_test),
@@ -1237,6 +1316,12 @@ def parse_args():
         parser.error("--output is required unless --self-test is used")
     if args.imatrix_strict and args.imatrix is None:
         parser.error("--imatrix-strict requires --imatrix")
+    if args.imatrix is not None and not args.allow_experimental_imatrix:
+        parser.error("Imatrix is parked: known DeltaNet channel-order issue; experimental use requires --allow-experimental-imatrix")
+    if args.chunk_rows <= 0 or args.validation_experts <= 0:
+        parser.error("--chunk-rows and --validation-experts must be positive")
+    if args.resume and args.model is None:
+        parser.error("--resume applies only to --model conversion")
     if args.imatrix is not None and (args.self_test or args.verify_only is not None):
         parser.error("--imatrix applies only to --model and --single-shard conversion")
     return args
