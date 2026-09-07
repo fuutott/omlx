@@ -1,5 +1,11 @@
 # Qwen3.8-Flash-Next T5 handoff
 
+Latest work (2026-09-07): [runtime tuning candidate and small evaluation loop](qwen4_flash_next_runtime_tuning.md).
+The prefix-fit/Q8-PLE artifact has since been baked and natively validated;
+the older no-conversion/pending-runtime statements below are historical.
+Freeze those weights for runtime tuning. New optimizations default off and
+still require their own native validation. Imatrix remains parked.
+
 Current status (2026-09-06): generated models were deleted on Windows and the
 later Mac performance work was rolled back. The first weight-only T5 was
 reasonably coherent with factual errors (user report); T5-imatrix was unusable.
