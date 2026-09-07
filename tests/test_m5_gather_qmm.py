@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import mlx.core as mx
 import pytest
 
@@ -20,6 +22,14 @@ def _fresh_state(monkeypatch):
     reinstall bypasses ``apply`` so a kill-switch env var set by the
     test cannot leave the session unwrapped.
     """
+    # Earlier model-loader tests may leave Bonsai above M5. Remove it first:
+    # treating that outer dispatcher as the native delegate would corrupt
+    # M5's global delegate during fixture teardown and manufacture recursion.
+    from omlx.patches import bonsai_t5_load
+
+    had_bonsai = bonsai_t5_load._patch_active
+    if had_bonsai:
+        bonsai_t5_load.remove_bonsai_t5_load_patch()
     monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
@@ -27,17 +37,56 @@ def _fresh_state(monkeypatch):
     if was_installed:
         mx.gather_qmm = raw
     yield
+    bonsai_t5_load.remove_bonsai_t5_load_patch()
     mx.gather_qmm = raw
     patch_mod._original_gather_qmm = raw
+    patch_mod._gather_qmm_rerouted.__wrapped__ = raw
     patch_mod._defective = saved_defective
     if was_installed:
         mx.gather_qmm = patch_mod._gather_qmm_rerouted
+    if had_bonsai:
+        bonsai_t5_load.apply_bonsai_t5_load_patch()
 
 
 def test_apply_idempotent():
     assert apply_m5_gather_qmm_workaround()
     assert getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     assert not apply_m5_gather_qmm_workaround()
+
+
+def test_reapply_beneath_bonsai_preserves_native_affine_dispatch():
+    """Benchmark unload/reload must not create M5 -> T5 -> M5 recursion."""
+    from omlx.patches.bonsai_t5_load import (
+        apply_bonsai_t5_load_patch,
+        remove_bonsai_t5_load_patch,
+    )
+
+    x = mx.ones((1, 1, 64), dtype=mx.float16)
+    w = mx.ones((2, 4, 64), dtype=mx.float16)
+    wq, scales, biases = mx.quantize(w, group_size=32, bits=2)
+    indices = mx.array([0], dtype=mx.uint32)
+    expected = mx.gather_qmm(
+        x, wq, scales, biases, rhs_indices=indices, group_size=32, bits=2
+    )
+    mx.eval(expected)
+    assert apply_m5_gather_qmm_workaround()
+    try:
+        for _ in range(3):
+            assert apply_bonsai_t5_load_patch()
+            outer = mx.gather_qmm
+            for _ in range(3):
+                assert not apply_m5_gather_qmm_workaround()
+                assert not apply_bonsai_t5_load_patch()
+                assert mx.gather_qmm is outer
+                actual = mx.gather_qmm(
+                    x, wq, scales, biases, rhs_indices=indices,
+                    group_size=32, bits=2,
+                )
+                assert mx.array_equal(actual, expected).item()
+            remove_bonsai_t5_load_patch()
+            assert mx.gather_qmm is patch_mod._gather_qmm_rerouted
+    finally:
+        remove_bonsai_t5_load_patch()
 
 
 def test_env_kill_switch(monkeypatch):
@@ -99,9 +148,7 @@ def test_wrapper_drops_sorted_flag_only_when_defective(monkeypatch):
 def _kernel_defective_here() -> bool:
     if not mx.metal.is_available():
         return False
-    raw = mx.gather_qmm
-    if getattr(raw, "_omlx_m5_reroute", False):
-        raw = patch_mod._original_gather_qmm
+    raw = inspect.unwrap(mx.gather_qmm)
     saved_orig, saved_flag = patch_mod._original_gather_qmm, patch_mod._defective
     patch_mod._original_gather_qmm = raw
     patch_mod._defective = None
