@@ -1,5 +1,10 @@
 # Qwen3.8-Flash-Next T5 handoff
 
+Latest candidate (2026-09-08): [Q8 MTP restoration](qwen4_mtp_q8.md).
+Separate augmented checkpoint; the measured no-MTP baseline is unchanged.
+Native MTP acceptance/parity/memory/speed are pending. KV-cache quantization
+is parked for upstream; do not explore or change it as part of this work.
+
 Latest work (2026-09-07): [runtime tuning candidate and small evaluation loop](qwen4_flash_next_runtime_tuning.md).
 The prefix-fit/Q8-PLE artifact has since been baked and natively validated;
 the older no-conversion/pending-runtime statements below are historical.

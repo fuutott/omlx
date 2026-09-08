@@ -1071,6 +1071,40 @@ def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
         configure_mtp_runtime(tmp_path, enabled=False)
 
 
+def test_qwen4_sanitize_preserves_presplit_q8_mtp_metadata(tmp_path):
+    """Q8 sidecar keys must bypass raw-HF gate/up splitting intact."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+    from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"mtp.fc_hidden.weight": "mtp-q8-g64.safetensors"}}),
+        encoding="utf-8",
+    )
+    configure_mtp_runtime(tmp_path, enabled=True)
+    try:
+        model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(
+            tie_word_embeddings=False, num_hidden_layers=1, num_experts=4,
+        )))
+        weights = {}
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"mtp.layers.0.mlp.switch_mlp.{projection}"
+            values = mx.quantize(mx.ones((4, 2, 64), dtype=mx.bfloat16), group_size=64, bits=8)
+            weights.update({f"{prefix}.{suffix}": value for suffix, value in
+                            zip(("weight", "scales", "biases"), values)})
+        # Trained MTP norms must not be re-centered using head-only statistics.
+        weights["mtp.pre_fc_norm_hidden.weight"] = mx.full((64,), 0.8, dtype=mx.bfloat16)
+        expected = dict(weights)
+        result = Model.sanitize(model, weights)
+        assert set(result) == set(expected)
+        for name, value in expected.items():
+            assert result[name].dtype == value.dtype
+            assert result[name].shape == value.shape
+            assert mx.array_equal(result[name], value).item()
+    finally:
+        configure_mtp_runtime(tmp_path, enabled=False)
+
+
 def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
