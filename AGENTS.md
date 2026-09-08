@@ -25,7 +25,9 @@ the cake" sections current in the same change whenever conversion policy,
 fitter/defaults, source revision, dependencies, CLI flags, artifact layout,
 MTP status, required runtime support or validated limitations change. Check the
 commands against the actual parsers and dependency lock; update the status date
-and distinguish measured results from pending validation. Preserve upstream's
+and distinguish measured results from pending validation. Keep the entire fork
+overview and recipe above the oMLX logo, with a prominent unofficial-fork notice
+and a clear boundary before upstream branding/documentation. Preserve upstream's
 README content outside this fork-specific section. Do not add generated-model
 download links, private model repository/mailbox coordinates, credentials or
 machine-specific private paths to this public section. The original source
