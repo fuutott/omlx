@@ -18,6 +18,21 @@ cache directories to Git. Keep Hugging Face downloads under an explicit
 `HF_HOME`. The converted checkpoint belongs in a Hugging Face model repository,
 not this Git repository.
 
+## Public recipe maintenance
+
+Keep README.md's "This fork: Qwen Flash Next on a 48 GB Mac" and "How to bake
+the cake" sections current in the same change whenever conversion policy,
+fitter/defaults, source revision, dependencies, CLI flags, artifact layout,
+MTP status, required runtime support or validated limitations change. Check the
+commands against the actual parsers and dependency lock; update the status date
+and distinguish measured results from pending validation. Preserve upstream's
+README content outside this fork-specific section. Do not add generated-model
+download links, private model repository/mailbox coordinates, credentials or
+machine-specific private paths to this public section. The original source
+model ID/revision in the reproduction commands is intentional. Keeping this
+documentation current does not authorize background polling, downloads or
+mailbox operations.
+
 The below-q2 T5 expert format is experimental. Do not describe the model as
 coherent or lossless until a real M3 Max run has completed. Record the exact
 commit, checkpoint revision, macOS/MLX versions, kernel availability, peak

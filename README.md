@@ -42,6 +42,181 @@
 
 ---
 
+## This fork: Qwen Flash Next on a 48 GB Mac
+
+This branch, `qwen4-flash-next-t5`, explores running **Qwen3.8-Flash-Next on a
+48 GB M3 Max** using low-bit routed experts and SSD-backed PLE n-gram embeddings.
+It is an experimental fork of oMLX, not an upstream release or a general-purpose
+Qwen quantizer. The model identifies as `qwen4_exp`: its hyper-connections,
+DeltaNet/QSA layers and PLE layout must not be treated as Qwen3.5.
+
+There are two separate workstreams: creating better compact weights, and making
+the native MLX/Metal runtime faster without changing those weights. The starting
+inspiration was AngelSlim's low-bit post-training quantization work, but this is
+**not Tencent's STQ1_0/GGUF recipe**. We use oMLX's Bonsai T5 format: five ternary
+digits packed per byte, with per-group scaling and padding. T5 here is a packing
+format, not the T5 language-model family. It is about 1.875 bits/weight including
+stored scale/bias overhead for the gate/up expert matrices, **not the whole model**.
+No AngelSlim checkout is needed to run this converter.
+
+Status, **2026-09-08**: the weight-only prefix-fit/Q8-PLE checkpoint has run on
+the target Mac, but quantization loss remains and speed depends on the workload.
+We are validating an upstream runtime merge at `4c2b05e4` (MLX 0.32.2); its Mac
+results are pending. Do not interpret structural checks as proof of quality,
+losslessness or a guaranteed throughput. The earlier importance-matrix experiment
+produced unusable output and is parked. Optional Q8 MTP is also experimental:
+prior native tests diverged from ordinary greedy decoding, so keep MTP disabled
+for baseline use. KV-cache quantization is left to upstream.
+
+### How to bake the cake
+
+These instructions create your own MLX safetensors checkpoint from the original
+source model. There are no links to our generated weights. Observe the source
+model's license and access conditions; the runtime's license does not replace them.
+
+#### Ingredients and current recipe
+
+The tested conversion route is **Windows + NVIDIA CUDA**, with `uv`, Python 3.12
+and the checked-in converter dependency lock. Our conversion host has 256 GB RAM
+and two GPUs totalling 144 GB VRAM; that is a tested host, **not a minimum
+requirement**. The converter uses one selected GPU in chunks, not pooled VRAM.
+Minimum RAM/VRAM has not been established. A smaller `--chunk-rows` reduces GPU
+working memory, but does not eliminate host-memory requirements.
+
+Budget roughly 360 GB for the source plus 92 GB for one converted checkpoint,
+with additional room for download caches, temporary files and optional copies;
+600 GB free is a sensible planning allowance, not a measured peak requirement.
+Use a fast SSD. The output is a directory of shards/config/tokenizer files,
+not a GGUF or one self-contained file.
+
+| Component | Current conversion |
+| --- | --- |
+| Routed expert gate/up | Bonsai T5, group 128, guarded weight-only prefix fitting |
+| Routed expert down | MLX affine Q2, group 128 |
+| PLE n-gram embeddings | MLX affine Q8, group 32; 128 independently mmap-able shards |
+| Shared experts / shared-expert gate | Affine Q8, group 128 / 64 |
+| Token embeddings and LM head | Affine Q6, group 64 |
+| Attention/DeltaNet projections | Affine Q5, group 64; QSA `o_proj` remains Q4/group 64 |
+| Other eligible matrices | Affine Q4, group 64 |
+| Vision, MoE routers, norms, convolutions and recurrent parameters | Retain source precision (BF16 in the pinned source) |
+| MTP | Omitted from the baseline; optional separate Q8 addition below |
+
+The Q8-PLE output is approximately **86 GiB on disk**, including approximately
+54 GiB of PLE tensors intended for SSD mmap. The static offloaded model estimate
+is approximately 34 GiB; **that is not total process memory**. Activations, KV
+cache, mmap working pages and runtime overhead still need headroom. PLE is kept
+at Q8 because its full table need not occupy unified memory. Do not reduce it to
+Q2 just to shrink an SSD-resident file.
+
+#### 1. Prepare an isolated converter and download the pinned source
+
+PowerShell, in a new checkout (adjust the SSD path first):
+
+```powershell
+git clone --branch qwen4-flash-next-t5 https://github.com/fuutott/omlx.git omlx-qwen48
+Set-Location omlx-qwen48
+git rev-parse HEAD  # Record this with your conversion results.
+
+uv venv .venv --python 3.12
+uv pip install --python .venv/Scripts/python.exe -r tools/qwen4_flash_next_quant.lock --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
+
+# Keep downloads and generated artifacts outside the Git checkout.
+$env:HF_HOME = 'D:\hf-cache'
+$env:HF_HUB_CACHE = Join-Path $env:HF_HOME 'hub'
+$env:HF_XET_CACHE = Join-Path $env:HF_HOME 'xet'
+$qwenRevision = 'de4b8e4d43b917e7706784d8bb445c9af86a3540'
+$qwenSource = Join-Path $env:HF_HUB_CACHE "models--Qwen--Qwen3.8-Flash-Next\snapshots\$qwenRevision"
+$qwenOutput = Join-Path $env:HF_HOME 'artifacts\qwen4-t5-prefix-ple8'
+
+# Install the HF CLI separately if needed; it does not belong in global Python.
+uv tool install huggingface_hub
+# If authentication is needed: hf auth login (never put tokens in this README).
+hf download Qwen/Qwen3.8-Flash-Next --revision $qwenRevision --cache-dir $env:HF_HUB_CACHE
+hf cache verify Qwen/Qwen3.8-Flash-Next --revision $qwenRevision --cache-dir $env:HF_HUB_CACHE --fail-on-missing-files
+```
+
+Stop on any command failure. On Windows, enabling Developer Mode permits HF
+cache symlinks and can avoid duplicate source storage. Do not install the Mac
+oMLX runtime into this Windows converter environment or let `uv` sync the root
+project's MLX dependencies. The commands below deliberately use `--no-project`.
+
+#### 2. Test, convert, verify
+
+```powershell
+uv run --no-project --python .venv/Scripts/python.exe python -B -m unittest discover -s tools/tests -v
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --self-test --device cuda:0
+
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenOutput --ple-bits 8 --t5-fitter prefix --device cuda:0 --chunk-rows 4096
+
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --verify-only $qwenOutput
+```
+
+Use a fresh output directory. After an interruption, rerun the **same conversion
+command** with `--resume`; the manifest must match source, converter, recipe and
+environment. A changed recipe/code/chunk size needs a new directory. Do not use
+`--imatrix`, `--allow-experimental-imatrix`, `--t5-fitter legacy` or `--ple-bits 2`
+for this baseline: those are historical/experimental controls.
+
+Keep `omlx_conversion.json`, `omlx_conversion_manifest.json`, the Git SHA and
+your command/environment record with the result. Verification checks schema,
+packing/layout and the SSD-offload representation, **not end-to-end accuracy**.
+Hash the shards before transfer and verify those hashes on the destination.
+Pin the Git revision and dependencies when comparing bakes; byte-identical
+output across arbitrary devices or library versions is not promised.
+
+#### 3. Optional Q8 MTP head — research only
+
+Skip this for the serial baseline. To reproduce the separate MTP experiment,
+reuse the same original source and completed base, and create a **new** directory:
+
+```powershell
+$qwenMtpOutput = Join-Path $env:HF_HOME 'artifacts\qwen4-t5-prefix-ple8-mtp8'
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/add_qwen4_mtp_q8.py --source $qwenSource --base $qwenOutput --output $qwenMtpOutput --device cuda:0 --link-mode hardlink
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/add_qwen4_mtp_q8.py --verify-only --base $qwenOutput --output $qwenMtpOutput
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/add_qwen4_mtp_q8.py --audit-only --source $qwenSource --base $qwenOutput --output $qwenMtpOutput
+```
+
+This adds one original MTP layer: affine Q8/group 64 matrices and BF16 norms and
+routers, sharing the target token embeddings/LM head. The extra shard is about
+2.58 GiB, before runtime overhead. Hardlinks require the same compatible
+filesystem (e.g. NTFS, not exFAT); use `--link-mode copy` otherwise and budget
+another full base copy. **Never edit shared shards in place.** The augmented
+directory has independent config/index files. Use its dedicated verifier, not
+the base converter's no-MTP verifier. Reconstruction audit is not KLD or proof
+that speculative decoding preserves target output.
+
+#### 4. Serve your bake on the Mac
+
+Transfer the **whole output directory**, not just the expert shards, to a fast
+Mac SSD. The Mac needs this fork's native T5 support, not the Windows Python
+environment or an AngelSlim checkout. Use a separate source checkout and `uv`
+environment, full Xcode/Metal tools, and build with `OMLX_WITH_CUSTOM_KERNEL=1`.
+Current dependencies include MLX 0.32.2; rebuild native extensions after dependency
+changes and verify `native_kernel_status()` before loading. Stock oMLX release
+install instructions below are not a substitute for this experimental build.
+
+Keep an existing mainline installation untouched: use the isolated environment's
+executable, separate server settings/base path and an unused port. Confirm PLE
+SSD offload is active and the model is detected as `qwen4_exp`. Begin with MTP
+off, one model/request at a time, a modest context (e.g. 8192), and memory guards
+enabled. Check short multilingual outputs and a 4096-token prefill before trying
+larger contexts. Record actual memory, swap, prefill and decode rates, not just
+checkpoint size. Test MTP-off/on token parity before interpreting any MTP speedup.
+
+The merged runtime defaults eager dispatch and fused HC on; fast RMS follows
+upstream unconditionally. `OMLX_QWEN4_EAGER_DISPATCH=0` and
+`OMLX_QWEN4_HC_FUSED=0` remain diagnostic switches. The old
+`OMLX_QWEN4_FAST_RMS_NORM` switch is gone. Our separate
+`OMLX_QWEN4_PLE_BATCHED_GATHER=1` experiment remains opt-in and is distinct from
+enabling SSD offload itself.
+
+This section is maintained with recipe/runtime changes; see the executable
+source of truth in [the base converter](tools/quantize_qwen4_flash_next_t5.py)
+and [the optional MTP converter](tools/add_qwen4_mtp_q8.py). The rest of this
+README documents upstream oMLX.
+
+---
+
 <p align="center">
   <img src="docs/images/omlx_dashboard.png" alt="oMLX Admin Dashboard" width="800">
 </p>
