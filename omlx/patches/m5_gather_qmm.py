@@ -128,9 +128,18 @@ def apply_m5_gather_qmm_workaround() -> bool:
     global _original_gather_qmm
     if os.environ.get("OMLX_M5_GATHER_QMM_FIX", "1") == "0":
         return False
-    if getattr(mx.gather_qmm, "_omlx_m5_reroute", False):
-        return False
+    # Another dispatcher (e.g. Bonsai T5) may sit above us after model load.
+    # Check the whole wrapper chain before changing our delegate; capturing
+    # that dispatcher again would create M5 -> T5 -> M5 recursion on reload.
+    current = mx.gather_qmm
+    seen = set()
+    while current is not None and id(current) not in seen:
+        if getattr(current, "_omlx_m5_reroute", False):
+            return False
+        seen.add(id(current))
+        current = getattr(current, "__wrapped__", None)
     _original_gather_qmm = mx.gather_qmm
+    _gather_qmm_rerouted.__wrapped__ = _original_gather_qmm
     mx.gather_qmm = _gather_qmm_rerouted
     logger.debug("m5 sorted gather_qmm reroute installed")
     return True

@@ -349,6 +349,9 @@ def apply_bonsai_t5_load_patch() -> bool:
     _original_quantized_matmul = _mx.quantized_matmul
     _mx.quantized_matmul = _t5_quantized_matmul
     _original_gather_qmm = _mx.gather_qmm
+    # Preserve wrapper-chain introspection so pre-load patches remain
+    # idempotent when this T5 dispatcher is the outermost callable.
+    _t5_gather_qmm.__wrapped__ = _original_gather_qmm
     _mx.gather_qmm = _t5_gather_qmm
 
     _patch_active = True
@@ -375,4 +378,5 @@ def remove_bonsai_t5_load_patch() -> None:
         import mlx.core as _mx
         _mx.gather_qmm = _original_gather_qmm
         _original_gather_qmm = None
+        del _t5_gather_qmm.__wrapped__
     _patch_active = False

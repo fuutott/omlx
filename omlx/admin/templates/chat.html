@@ -3905,9 +3905,10 @@
                 stream.targetMessageId = null;
                 stream._statsRequestId = null;
                 stream._liveFooterStats = null;
-                if (stream._domUpdateRaf) {
-                    cancelAnimationFrame(stream._domUpdateRaf);
-                    stream._domUpdateRaf = null;
+                const renderState = Alpine.raw(stream);
+                if (renderState._domUpdateTimer != null) {
+                    clearTimeout(renderState._domUpdateTimer);
+                    renderState._domUpdateTimer = null;
                 }
             },
 
@@ -7256,15 +7257,22 @@
         }
     },
 
-    // Efficiently update streaming DOM without destroying thinking container
+    // Coalesce streamed answer paints to at most 5 Hz. Token receipt and the
+    // final message render are independent of this intermediate display timer.
     updateStreamingDOM(_contentTick) {
         const stream = this.currentStream();
         if (!stream?.isStreaming) return;
-        if (stream._domUpdateRaf) cancelAnimationFrame(stream._domUpdateRaf);
-        stream._domUpdateRaf = requestAnimationFrame(() => {
-            stream._domUpdateRaf = null;
-            this._updateStreamingDOMImpl();
-        });
+        // x-effect must not subscribe to the scheduling handle. Clearing a
+        // reactive handle inside its callback would schedule another paint,
+        // even without a new token (a display-refresh-rate feedback loop).
+        const renderState = Alpine.raw(stream);
+        if (renderState._domUpdateTimer != null) return;
+        renderState._domUpdateTimer = setTimeout(() => {
+            renderState._domUpdateTimer = null;
+            if (this.currentStream() === stream && stream.isStreaming) {
+                this._updateStreamingDOMImpl();
+            }
+        }, 200);
     },
 
     _updateStreamingDOMImpl() {
