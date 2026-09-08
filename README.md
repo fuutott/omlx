@@ -25,8 +25,12 @@ Status, **2026-09-08**: the weight-only prefix-fit/Q8-PLE checkpoint has run on
 the target Mac, but quantization loss remains and speed depends on the workload.
 We are validating an upstream runtime merge at `4c2b05e4` (MLX 0.32.2); its Mac
 results are pending. Do not interpret structural checks as proof of quality,
-losslessness or a guaranteed throughput. The earlier importance-matrix experiment
-produced unusable output and is parked. Optional Q8 MTP is also experimental:
+losslessness or a guaranteed throughput. The Unsloth importance matrix is now applied
+through a verified tensor mapping (DeltaNet `out_proj` un-permuted) and measured by
+KL divergence against a Q8_0 teacher: on wikitext-2 the weight-only T5 bake scores
+mean KLD 0.69, T5 with imatrix 0.57, affine Q2 with imatrix 0.48, Unsloth UD-Q4_K_XL
+0.036. The earlier unusable imatrix bake predates the mapping fix and the
+prefix fitter. Optional Q8 MTP is also experimental:
 prior native tests diverged from ordinary greedy decoding, so keep MTP disabled
 for baseline use. KV-cache quantization is left to upstream.
 
@@ -70,6 +74,8 @@ cache, mmap working pages and runtime overhead still need headroom. PLE is kept
 at Q8 because its full table need not occupy unified memory. Do not reduce it to
 Q2 just to shrink an SSD-resident file.
 
+Step 2b describes the stock-oMLX variant with affine experts instead of T5.
+
 #### 1. Prepare an isolated converter and download the pinned source
 
 PowerShell, in a new checkout (adjust the SSD path first):
@@ -108,16 +114,17 @@ project's MLX dependencies. The commands below deliberately use `--no-project`.
 uv run --no-project --python .venv/Scripts/python.exe python -B -m unittest discover -s tools/tests -v
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --self-test --device cuda:0
 
-uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenOutput --ple-bits 8 --t5-fitter prefix --device cuda:0 --chunk-rows 4096
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenOutput --ple-bits 8 --t5-fitter prefix --device cuda:0 --chunk-rows 4096 --imatrix $imatrix --imatrix-strict --allow-experimental-imatrix --clip-search --vision-bits 8
 
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --verify-only $qwenOutput
 ```
 
 Use a fresh output directory. After an interruption, rerun the **same conversion
 command** with `--resume`; the manifest must match source, converter, recipe and
-environment. A changed recipe/code/chunk size needs a new directory. Do not use
-`--imatrix`, `--allow-experimental-imatrix`, `--t5-fitter legacy` or `--ple-bits 2`
-for this baseline: those are historical/experimental controls.
+environment. A changed recipe/code/chunk size needs a new directory. `$imatrix` is
+the Unsloth file downloaded in step 2b; omit the imatrix flags to reproduce the
+historical weight-only bake. `--t5-fitter legacy` and `--ple-bits 2` are historical
+controls only.
 
 Keep `omlx_conversion.json`, `omlx_conversion_manifest.json`, the Git SHA and
 your command/environment record with the result. Verification checks schema,
@@ -125,6 +132,33 @@ packing/layout and the SSD-offload representation, **not end-to-end accuracy**.
 Hash the shards before transfer and verify those hashes on the destination.
 Pin the Git revision and dependencies when comparing bakes; byte-identical
 output across arbitrary devices or library versions is not promised.
+
+#### 2b. Stock-oMLX variant: affine experts, no T5
+
+`--expert-format affine` stores every routed expert projection as plain MLX
+affine Q2 (group 128) and writes no T5 loader marker, so the result loads on
+stock oMLX with Qwen4-Exp PLE SSD support and needs none of this fork's kernels
+or patches. Resident weights are about 36 GiB instead of 31 GiB. In this mode
+every affine tensor gets an importance-weighted range search over both edges
+(`--no-clip-search` disables it), and the Unsloth llama.cpp imatrix weights the
+routed experts plus every mapped projection whose GGUF input-channel order was
+checked against llama.cpp's `conversion/qwen4exp.py` (`--imatrix-scope safe`,
+the default). llama.cpp stores DeltaNet V heads in a tiled order, which permutes
+`out_proj`'s input columns; the importer undoes that permutation for `ssm_out`,
+so `out_proj` is weighted correctly. A name/shape match alone cannot detect such
+a permutation, so add tensors to the safe list only after reading the GGUF
+converter. `--expert-down-bits 3` raises down_proj to Q3 for about 4.7 GiB more.
+`--vision-bits 8` quantizes the ViT's Linear layers (about 0.25 GiB saved); the
+vision tower cannot be dropped entirely because the runtime always builds it and
+loads weights strictly.
+
+```powershell
+hf download unsloth/Qwen3.8-Flash-Next-GGUF imatrix_unsloth.gguf_file --cache-dir $env:HF_HUB_CACHE
+$imatrix = Get-ChildItem (Join-Path $env:HF_HUB_CACHE 'models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots') -Recurse -Filter imatrix_unsloth.gguf_file | Select-Object -First 1 -ExpandProperty FullName
+$qwenAffineOutput = Join-Path $env:HF_HOME 'artifacts\qwen4-affine-q2-imatrix-ple8'
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenAffineOutput --expert-format affine --imatrix $imatrix --imatrix-strict --vision-bits 8 --device cuda:0 --chunk-rows 4096
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --verify-only $qwenAffineOutput
+```
 
 #### 3. Optional Q8 MTP head — research only
 

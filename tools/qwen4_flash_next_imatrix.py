@@ -21,6 +21,9 @@ import numpy as np
 
 
 _HF_LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.(.+)$")
+# Qwen3.8-Flash-Next DeltaNet geometry; convert() re-checks it against config.
+QWEN4_LINEAR_ATTENTION = {"num_k_heads": 16, "num_v_heads": 48, "head_dim": 128}
+_OUT_PROJ_SUFFIX = ".linear_attn.out_proj.weight"
 _EXPERT_RE = re.compile(r"^mlp\.experts\.(gate_up_proj|down_proj)$")
 
 # Input-channel-equivalent tensor names between the official HF checkpoint and
@@ -48,6 +51,28 @@ _SUFFIX_MAP = {
     "mlp_hyper_connection.input_mix_weight_up.weight": "hc_ffn_up.weight",
     "mlp_hyper_connection.block_inject_weight.weight": "hc_ffn_inject.weight",
 }
+
+
+def unpermute_tiled_v_heads(values, num_k_heads: int, num_v_heads: int, head_dim: int):
+    """Map llama.cpp's tiled V-head channel order back to HF's grouped order.
+
+    llama.cpp's converter (``conversion/qwen.py``, ``_LinearAttentionVReorderBase``)
+    reorders DeltaNet V heads from HF's grouped layout ``(k, r, d)`` to a tiled
+    layout ``(r, k, d)`` so ``ggml_repeat`` can broadcast the K heads.  It applies
+    the same permutation to ``out_proj``'s input columns, so an imatrix collected
+    on the GGUF lists ``ssm_out`` channels in tiled order.  Every other mapped
+    tensor keeps its HF input order.
+    """
+    values = np.asarray(values)
+    width = num_v_heads * head_dim
+    if num_k_heads <= 0 or num_v_heads % num_k_heads or values.shape[-1] != width:
+        raise ValueError(
+            f"cannot unpermute channels of shape {values.shape} with "
+            f"{num_k_heads}/{num_v_heads} heads x {head_dim}"
+        )
+    per_k = num_v_heads // num_k_heads
+    tiled = values.reshape(*values.shape[:-1], per_k, num_k_heads, head_dim)
+    return np.ascontiguousarray(np.swapaxes(tiled, -3, -2)).reshape(values.shape)
 
 
 def gguf_name_for_hf_tensor(hf_name: str, projection: str | None = None) -> str | None:
@@ -118,6 +143,8 @@ class GGUFImatrix:
             raise ValueError(f"imatrix has orphan counts tensors: {orphan_counts[:5]}")
 
         self.applied: set[str] = set()
+        self.unpermuted: set[str] = set()
+        self.linear_attention = dict(QWEN4_LINEAR_ATTENTION)
         self.missing: set[str] = set()
         self.mismatched: list[dict[str, Any]] = []
         self.imputed_experts: dict[str, int] = {}
@@ -195,6 +222,14 @@ class GGUFImatrix:
             raise ValueError(f"imatrix shape mismatch: {item}")
         return None
 
+    def configure_linear_attention(self, num_k_heads: int, num_v_heads: int, head_dim: int) -> None:
+        """Bind the DeltaNet head geometry used to unpermute out_proj channels."""
+        self.linear_attention = {
+            "num_k_heads": int(num_k_heads),
+            "num_v_heads": int(num_v_heads),
+            "head_dim": int(head_dim),
+        }
+
     def importance_for_hf(
         self,
         hf_name: str,
@@ -206,7 +241,11 @@ class GGUFImatrix:
         base = gguf_name_for_hf_tensor(hf_name, projection)
         if base is None:
             return None
-        return self.importance_for_gguf(base, weight_shape, strict=strict)
+        values = self.importance_for_gguf(base, weight_shape, strict=strict)
+        if values is not None and hf_name.endswith(_OUT_PROJ_SUFFIX):
+            values = unpermute_tiled_v_heads(values, **self.linear_attention)
+            self.unpermuted.add(base)
+        return values
 
     def summary(self, *, include_hash: bool = True) -> dict[str, Any]:
         expert_entries = 0
@@ -228,6 +267,8 @@ class GGUFImatrix:
             "expert_slots": total_experts,
             "zero_count_expert_slots": zero_experts,
             "applied_entries": sorted(self.applied),
+            "v_head_unpermuted_entries": sorted(self.unpermuted),
+            "linear_attention": dict(self.linear_attention),
             "missing_entries": sorted(self.missing),
             "mismatched_entries": self.mismatched,
             "zero_count_experts_imputed": sum(self.imputed_experts.values()),

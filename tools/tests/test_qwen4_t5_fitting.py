@@ -144,12 +144,16 @@ class T5FittingTests(unittest.TestCase):
             q.weighted_ternary_chunk(torch.ones((1, 128)), rounds=0)
         with self.assertRaises(ValueError):
             q.weighted_ternary_chunk(torch.ones((1, 128)), fitter="typo")
-        with self.assertRaises(ValueError):
-            q.weighted_ternary_chunk(torch.ones((1, 128)), importance=torch.ones((1, 128)))
-        command = ["--model", "source", "--output", "dest", "--imatrix", "parked.gguf", "--allow-experimental-imatrix"]
+        # Both fitters accept an importance matrix (2026-09-08); the imatrix
+        # still needs the explicit experimental opt-in for T5 bakes.
+        packed, scales = q.weighted_ternary_chunk(torch.ones((1, 128)), importance=torch.ones((1, 128)))
+        self.assertTrue(torch.isfinite(scales.float()).all())
+        command = ["--model", "source", "--output", "dest", "--imatrix", "parked.gguf"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             q.parse_args(command)
-        self.assertEqual(q.parse_args(command + ["--t5-fitter", "legacy"]).t5_fitter, "legacy")
+        opted_in = command + ["--allow-experimental-imatrix"]
+        self.assertEqual(q.parse_args(opted_in).t5_fitter, "prefix")
+        self.assertEqual(q.parse_args(opted_in + ["--t5-fitter", "legacy"]).t5_fitter, "legacy")
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_cuda_legacy_identity_and_prefix_guard(self):

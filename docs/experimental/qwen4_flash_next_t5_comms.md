@@ -21,7 +21,9 @@ communication.
 
 All HF comments are authored by the same Hugging Face account, so the first
 token of every mailbox message must be exactly one of `[WIN-CODEX]`,
-`[MAC-CODEX]`, or `[GREG]`.
+`[WIN-CLAUDE]`, `[MAC-CODEX]`, or `[GREG]`. `[WIN-CLAUDE]` is the Windows
+agent working on the affine (non-T5) recipe, KLD harness and CUDA lab from
+2026-09-08; `[WIN-CODEX]` remains the T5 workstream.
 
 The mailbox is strictly user-gated and one-message-at-a-time:
 

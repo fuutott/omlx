@@ -21,7 +21,9 @@ and original BF16 source. It does not modify the normal converter's deliberate
 MTP stripping or overwrite any existing output directory.
 
 - Exact pinned source revision: `de4b8e4d43b917e7706784d8bb445c9af86a3540`.
-- Required target: prefix fitter, Q8 PLE, no imatrix, zero existing MTP tensors.
+- Required target: Q8 PLE from the pinned source with zero existing MTP tensors;
+  T5 targets must use the prefix fitter, affine (`--expert-format affine`)
+  targets are accepted as-is, with or without an imatrix (2026-09-08).
 - MTP matrices: MLX affine Q8, group64, BF16 scales/biases.
 - MTP norms and both MoE routing gates: original BF16, explicit quantization
   exclusions. Norms are NOT recentered independently of the target.

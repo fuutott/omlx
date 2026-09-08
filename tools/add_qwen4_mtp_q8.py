@@ -1,4 +1,4 @@
-"""Restore the original Qwen4 MTP head without requantizing the T5 target.
+"""Restore the original Qwen4 MTP head without requantizing the quantized target.
 
 Windows/CUDA converter; no MLX import. Output is a NEW checkpoint directory.
 Only immutable base safetensors are hardlinked; metadata is always independent.
@@ -270,8 +270,15 @@ def build(args):
     base_converter.validate_config(source_config)
     base_result = base_converter.verify_checkpoint(base)
     base_report = read_json(base / "omlx_conversion.json")
-    if base_report["source_revision"] != SOURCE_REVISION or base_report["recipe"].get("t5_fitter") != "prefix" or base_result.get("ple_bits") != 8 or base_report["recipe"].get("importance_matrix") is not None:
-        raise ValueError("Requires the pinned prefix-fit/Q8-PLE, no-imatrix target")
+    recipe = base_report["recipe"]
+    expert_format = recipe.get("expert_format", "t5")
+    if base_report["source_revision"] != SOURCE_REVISION or base_result.get("ple_bits") != 8:
+        raise ValueError("Requires a target baked from the pinned source with Q8 PLE")
+    if expert_format == "t5" and recipe.get("t5_fitter") != "prefix":
+        raise ValueError("T5 targets must use the prefix fitter")
+    if expert_format not in ("t5", "affine"):
+        raise ValueError(f"Unknown target expert format: {expert_format}")
+    imatrix_file = (recipe.get("importance_matrix") or {}).get("file")
     source_index = read_json(source / "model.safetensors.index.json")["weight_map"]
     inventory = {k: v for k, v in source_index.items() if k.startswith("mtp.")}
     expected = expected_source_shapes()
@@ -324,12 +331,14 @@ def build(args):
     report["verification"] = {"base_before_mtp": base_result, "mtp_tensors": len(result), "mtp_bytes": payload}
     report["validation_status"] = "MTP structural validation only; native MTP pending"
     write_json(output / "omlx_conversion.json", report)
+    target_label = "T5 prefix" if expert_format == "t5" else "affine"
     (output / "README.md").write_text(
-        "# Experimental T5 prefix / Q8 PLE / Q8 MTP candidate\n\n"
+        f"# Experimental {target_label} / Q8 PLE / Q8 MTP candidate\n\n"
         "Original target weights unchanged. One original MTP layer restored with affine Q8/group64, "
         "BF16 norms and routers. Reuses target token embeddings and LM head. PLE must stay SSD-offloaded.\n\n"
         "Native MTP load, greedy parity, rollback, acceptance, peak memory and speed are NOT yet validated. "
-        "Start depth 1 in an isolated runtime under the existing memory guard. No imatrix.\n\n"
+        "Start depth 1 in an isolated runtime under the existing memory guard. "
+        f"Target importance matrix: {imatrix_file or 'none'} (the MTP head itself is weight-only Q8).\n\n"
         "Base safetensors may be hardlinked: never edit any shard in place. Metadata files are independent. "
         "See tools/add_qwen4_mtp_q8.py and docs/experimental/qwen4_mtp_q8.md in the experimental omlx branch.\n",
         encoding="utf-8")

@@ -103,6 +103,15 @@ The current recipe is:
 - vision, routers, recurrent state, convolutions, and norms: BF16;
 - MTP weights: removed for this first 48 GB target.
 
+Added 2026-09-08: `--expert-format affine` bakes plain MLX affine Q2/Q3 routed
+experts with no T5 marker, for stock oMLX. Affine tensors then use a two-edge
+importance-weighted range search, and `--imatrix-scope safe` limits imatrix
+weighting to tensors whose GGUF input order was checked against llama.cpp's
+`conversion/qwen4exp.py`. The DeltaNet `out_proj` permutation noted below is
+llama.cpp's tiled V-head reorder; `tools/qwen4_flash_next_imatrix.py` now
+undoes it for `ssm_out`, which resolves that finding. See the README "How to
+bake the cake" step 2b.
+
 The runtime additions teach the Bonsai T5 loader to accept rank-3 expert banks,
 add a native routed T5 gather-QMV path for decode, and reuse dense T5 QMM over
 contiguous expert runs during sorted prefill. Qwen gate/up fusion also accepts

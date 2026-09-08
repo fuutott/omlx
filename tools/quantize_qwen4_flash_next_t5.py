@@ -5,10 +5,17 @@ This is intentionally architecture-specific.  It accepts only the experimental
 ``qwen4_exp`` schema published as Qwen3.8-Flash-Next; it is not a Qwen3.5
 converter.
 
-The memory-critical routed experts use two formats:
+The memory-critical routed experts use two formats by default:
 
 * gate/up: weighted least-squares ternary, packed as Bonsai t5 (base-3)
 * down: ordinary MLX affine q2
+
+``--expert-format affine`` instead stores every routed projection as plain MLX
+affine q2/q3 (group 128), which loads on stock oMLX without the Bonsai
+extension or loader patches.  Affine tensors get an importance-weighted range
+search by default in that mode; a llama.cpp GGUF imatrix can weight the routed
+experts and the projections whose GGUF input-channel order is known to match
+the HF layout.
 
 PLE n-gram embeddings default to affine q8/group-32 and remain individually sharded,
 which lets OMLX mmap them from SSD.  Small/sensitive language projections use
@@ -39,9 +46,56 @@ from typing import Any
 EXPECTED_REPO = "Qwen/Qwen3.8-Flash-Next"
 BASE_QUANT = {"bits": 4, "group_size": 64, "mode": "affine"}
 T5_GROUP_SIZE = 128
+EXPERT_GROUP_SIZE = T5_GROUP_SIZE
 PLE_GROUP_SIZE = 32
 PLE_BITS = 8
 T5_FITTER = "prefix"
+EXPERT_FORMAT = "t5"
+EXPERT_FORMATS = ("t5", "affine")
+EXPERT_BITS_CHOICES = (2, 3)
+IMATRIX_SCOPE = "safe"
+IMATRIX_SCOPES = ("safe", "experts", "all")
+# Non-expert projections whose imatrix channels are known to line up with the
+# HF weight columns, checked against llama.cpp's conversion/qwen4exp.py and
+# conversion/qwen.py: every mapped tensor is stored with HF input order except
+# DeltaNet out_proj, whose columns follow the tiled V-head reorder; the
+# importer undoes that permutation.  A name/shape match alone cannot detect a
+# permutation, so add entries here only after reading the GGUF converter.
+_IMATRIX_SAFE_SUFFIXES = (
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_a",
+    "linear_attn.in_proj_b",
+    "linear_attn.out_proj",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.shared_expert_gate",
+    "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.up_proj",
+    "mlp.shared_expert.down_proj",
+    "attn_hyper_connection.input_mix_weight_down",
+    "attn_hyper_connection.input_mix_weight_up",
+    "attn_hyper_connection.block_inject_weight",
+    "mlp_hyper_connection.input_mix_weight_down",
+    "mlp_hyper_connection.input_mix_weight_up",
+    "mlp_hyper_connection.block_inject_weight",
+)
+# Each affine range edge is tried at these multiples of its min/max value.
+_CLIP_FACTORS = (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3)
+VISION_BITS_CHOICES = (0, 8)
+# Vision-tower Linear modules that may be quantized.  The Conv3d patch embed,
+# positional embedding, norms and biases stay BF16, as does any Linear whose
+# input width is not a multiple of the group (the 4304-wide fc2).
+_VISION_LINEAR_SUFFIXES = (
+    "attn.qkv",
+    "attn.proj",
+    "mlp.linear_fc1",
+    "mlp.linear_fc2",
+    "merger.linear_fc1",
+    "merger.linear_fc2",
+)
 _EXPERT_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_up_proj|down_proj)$")
 _PLE_RE = re.compile(r"\.ple\.ple_embedding\.ngram_embedding\.shard_(\d+)\.weight$")
 _RUNTIME_EXPERT_RE = re.compile(
@@ -85,6 +139,12 @@ def conversion_identity(source: Path, shards: list[str], args) -> dict[str, Any]
         "ple_bits": args.ple_bits,
         "ple_group_size": PLE_GROUP_SIZE,
         "t5_fitter": getattr(args, "t5_fitter", T5_FITTER),
+        "expert_format": getattr(args, "expert_format", EXPERT_FORMAT),
+        "expert_gate_up_bits": getattr(args, "expert_gate_up_bits", 2),
+        "expert_down_bits": getattr(args, "expert_down_bits", 2),
+        "imatrix_scope": getattr(args, "imatrix_scope", IMATRIX_SCOPE),
+        "clip_search": resolve_clip_search(args),
+        "vision_bits": getattr(args, "vision_bits", 0),
         "imatrix_sha256": _sha256(args.imatrix) if args.imatrix else None,
         "imatrix_importer_sha256": (
             _sha256(Path(__file__).with_name("qwen4_flash_next_imatrix.py"))
@@ -95,6 +155,14 @@ def conversion_identity(source: Path, shards: list[str], args) -> dict[str, Any]
         "device": args.device,
         "chunk_rows": args.chunk_rows,
     }
+
+
+def resolve_clip_search(args) -> bool:
+    """Range search defaults on for affine expert bakes, off for the T5 recipe."""
+    explicit = getattr(args, "clip_search", None)
+    if explicit is None:
+        return getattr(args, "expert_format", EXPERT_FORMAT) == "affine"
+    return bool(explicit)
 
 
 def prepare_output(output: Path, identity: dict[str, Any], *, resume: bool) -> str:
@@ -139,9 +207,22 @@ def _load_imatrix(args):
     return args.imatrix_data
 
 
+def _imatrix_in_scope(name: str, scope: str) -> bool:
+    """Decide whether a raw HF tensor may take imatrix weighting."""
+    if scope == "all":
+        return True
+    if _EXPERT_RE.match(name):
+        return True
+    if scope == "experts":
+        return False
+    return any(name.endswith(f".{suffix}.weight") for suffix in _IMATRIX_SAFE_SUFFIXES)
+
+
 def _importance_for(args, name: str, tensor, *, projection: str | None = None):
     matrix = getattr(args, "imatrix_data", None)
     if matrix is None:
+        return None
+    if not _imatrix_in_scope(name, getattr(args, "imatrix_scope", IMATRIX_SCOPE)):
         return None
     return matrix.importance_for_hf(
         name,
@@ -304,14 +385,17 @@ def weighted_ternary_chunk(weight, rounds: int = 8, importance=None, *, fitter: 
     grouped = weight.float().reshape(-1, original[-1] // T5_GROUP_SIZE, T5_GROUP_SIZE)
     if not torch.isfinite(grouped).all():
         raise ValueError("T5 weights must be finite")
+    # Weight-only objective of the first T5: importance = sqrt(2*mean(w^2) + w^2),
+    # llama.cpp's k-quant magnitude term.  With an imatrix, multiply that term by
+    # the per-channel activation energy, as llama.cpp does for its low-bit types,
+    # rather than replacing it: raw energy alone lets a few hot channels dictate
+    # the single group scale.  Both fitters accept any positive importance.
+    sigma2 = 2.0 * grouped.square().mean(dim=-1, keepdim=True)
+    magnitude = torch.sqrt(sigma2 + grouped.square())
     if importance is None:
-        # Same objective as the first, weight-only T5; only the solver changes.
-        sigma2 = 2.0 * grouped.square().mean(dim=-1, keepdim=True)
-        importance = torch.sqrt(sigma2 + grouped.square())
+        importance = magnitude
     else:
-        if fitter != "legacy":
-            raise ValueError("Prefix T5 fitting is weight-only; parked imatrix requires fitter='legacy'")
-        importance = importance.float().reshape_as(grouped).clamp_min(1e-8)
+        importance = importance.float().reshape_as(grouped).clamp_min(1e-8) * magnitude
     if not torch.isfinite(importance).all():
         raise ValueError("T5 importance must be finite (check weight magnitude)")
     selection, scale = _legacy_ternary_fit(grouped, importance, rounds)
@@ -324,14 +408,9 @@ def weighted_ternary_chunk(weight, rounds: int = 8, importance=None, *, fitter: 
     return pack_t5(codes), scale.reshape(scale_shape).to(torch.bfloat16)
 
 
-def affine_chunk(weight, bits: int, group_size: int, importance=None):
-    """Torch implementation of MLX affine quantization and bit-plane packing."""
+def _affine_params(low, high, bins: float):
+    """MLX affine scale/bias for a [low, high] range, including edge snapping."""
     torch = _torch()
-    original = tuple(weight.shape)
-    grouped = weight.float().reshape(-1, original[-1] // group_size, group_size)
-    bins = float((1 << bits) - 1)
-    high = grouped.amax(dim=-1, keepdim=True)
-    low = grouped.amin(dim=-1, keepdim=True)
     negative_edge = low.abs() > high.abs()
     scale = ((high - low) / bins).clamp_min(1e-7)
     scale = torch.where(negative_edge, scale, -scale)
@@ -339,37 +418,50 @@ def affine_chunk(weight, bits: int, group_size: int, importance=None):
     q0 = torch.round(edge / scale)
     bias = torch.where(q0 != 0, edge, torch.zeros_like(edge))
     scale = torch.where(q0 != 0, edge / q0, scale)
-    if importance is not None:
-        # Port of OMLX oQe's imatrix-weighted clipping search.  The candidates
-        # preserve MLX affine semantics; only scale selection changes.
-        imp = importance.float().reshape_as(grouped).clamp_min(1e-8)
-        best_scale = scale
-        best_bias = bias
-        best_codes = torch.round((grouped - bias) / scale).clamp(0, bins)
-        best_error = (imp * (grouped - (best_codes * scale + bias)).square()).sum(
-            dim=-1, keepdim=True
-        )
-        for candidate_edge, opposite, sign in (
-            (high, low, -1.0),
-            (low, high, 1.0),
-        ):
-            raw = ((candidate_edge - opposite).abs() / bins).clamp_min(1e-7) * sign
-            q0 = torch.round(candidate_edge / raw)
-            scale0 = torch.where(q0 != 0, candidate_edge / q0, raw)
-            bias0 = torch.where(q0 != 0, candidate_edge, torch.zeros_like(candidate_edge))
-            for factor in (0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25):
-                candidate_scale = scale0 * factor
-                candidate_codes = torch.round(
-                    (grouped - bias0) / candidate_scale
-                ).clamp(0, bins)
+    return scale, bias
+
+
+def affine_chunk(weight, bits: int, group_size: int, importance=None, *, clip_search: bool = False):
+    """Torch implementation of MLX affine quantization and bit-plane packing.
+
+    With ``clip_search`` (or an importance matrix) each range edge is tried at
+    several multiples of its min/max value and the candidate with the lowest
+    importance-weighted squared error is kept.  Candidates are evaluated with
+    the BF16 scale/bias that are actually stored, and plain min/max is always
+    among them, so the search never loses to the default range.  The dequant
+    semantics are unchanged: any stored scale/bias pair is valid MLX affine.
+    """
+    torch = _torch()
+    original = tuple(weight.shape)
+    grouped = weight.float().reshape(-1, original[-1] // group_size, group_size)
+    bins = float((1 << bits) - 1)
+    high = grouped.amax(dim=-1, keepdim=True)
+    low = grouped.amin(dim=-1, keepdim=True)
+    scale, bias = _affine_params(low, high, bins)
+    if importance is not None or clip_search:
+        if importance is None:
+            imp = torch.ones_like(grouped)
+        else:
+            imp = importance.float().reshape_as(grouped).clamp_min(1e-8)
+        best_scale = best_bias = best_error = None
+        for low_factor in _CLIP_FACTORS:
+            for high_factor in _CLIP_FACTORS:
+                candidate_scale, candidate_bias = _affine_params(
+                    low * low_factor, high * high_factor, bins
+                )
+                candidate_scale = candidate_scale.to(torch.bfloat16).float()
+                candidate_bias = candidate_bias.to(torch.bfloat16).float()
+                codes = torch.round((grouped - candidate_bias) / candidate_scale).clamp(0, bins)
                 error = (
-                    imp
-                    * (grouped - (candidate_codes * candidate_scale + bias0)).square()
+                    imp * (grouped - (codes * candidate_scale + candidate_bias)).square()
                 ).sum(dim=-1, keepdim=True)
+                if best_error is None:
+                    best_scale, best_bias, best_error = candidate_scale, candidate_bias, error
+                    continue
                 take = error < best_error
                 best_error = torch.where(take, error, best_error)
                 best_scale = torch.where(take, candidate_scale, best_scale)
-                best_bias = torch.where(take, bias0, best_bias)
+                best_bias = torch.where(take, candidate_bias, best_bias)
         scale, bias = best_scale, best_bias
     codes = torch.round((grouped - bias) / scale).clamp(0, bins).to(torch.int64)
 
@@ -424,6 +516,7 @@ def quantize_chunked(
     chunk_rows: int,
     importance=None,
     t5_fitter: str = T5_FITTER,
+    clip_search: bool = False,
 ):
     torch = _torch()
     shape = tuple(weight.shape)
@@ -460,7 +553,9 @@ def quantize_chunked(
             packed, scales = weighted_ternary_chunk(chunk, importance=chunk_importance, fitter=t5_fitter)
             result = (packed, scales, -scales)
         else:
-            result = affine_chunk(chunk, bits, group_size, importance=chunk_importance)
+            result = affine_chunk(
+                chunk, bits, group_size, importance=chunk_importance, clip_search=clip_search
+            )
         for target, value in zip(outputs, result):
             target.append(value.cpu())
         del chunk, chunk_importance, result
@@ -474,12 +569,18 @@ def quantize_chunked(
     )
 
 
-def quant_spec(name: str, tensor) -> tuple[str, int, int] | None:
+def quant_spec(name: str, tensor, *, vision_bits: int = 0) -> tuple[str, int, int] | None:
     """Architecture-aware precision policy for non-routed tensors."""
     lower = name.lower()
     if tensor.ndim < 2 or not name.endswith(".weight"):
         return None
     if name.startswith("vision_tower."):
+        if (
+            vision_bits
+            and tensor.ndim == 2
+            and module_name(name).endswith(_VISION_LINEAR_SUFFIXES)
+        ):
+            return ("affine", vision_bits, 64)
         return None
     if lower.endswith(".mlp.gate.weight") or lower.endswith(".router.weight"):
         return None
@@ -515,7 +616,10 @@ def _quantized_entries(
     args,
     per_layer,
     importance=None,
+    clip_search: bool | None = None,
 ):
+    if clip_search is None:
+        clip_search = resolve_clip_search(args)
     if weight.shape[-1] % group_size or (weight.shape[-1] * bits) % 32:
         raise ValueError(f"{base}: width {weight.shape[-1]} is incompatible with {kind} {bits}-bit/group-{group_size}")
     packed, scales, biases = quantize_chunked(
@@ -527,6 +631,7 @@ def _quantized_entries(
         args.chunk_rows,
         importance=importance,
         t5_fitter=getattr(args, "t5_fitter", T5_FITTER),
+        clip_search=clip_search,
     )
     if kind == "t5" or bits != BASE_QUANT["bits"] or group_size != BASE_QUANT["group_size"]:
         per_layer[base] = {"bits": bits, "group_size": group_size, "mode": "affine"}
@@ -542,42 +647,41 @@ def transform(name: str, tensor, args, per_layer: dict[str, dict[str, Any]]):
     if match:
         layer, projection = match.groups()
         prefix = f"language_model.model.layers.{layer}.mlp.switch_mlp"
+        expert_format = getattr(args, "expert_format", EXPERT_FORMAT)
         if projection == "gate_up_proj":
             if tensor.shape[-2] % 2:
                 raise ValueError(f"{name}: fused gate/up row count is odd")
             gate, up = tensor.chunk(2, dim=-2)
+            if expert_format == "t5":
+                kind, bits = "t5", 2
+            else:
+                kind, bits = "affine", getattr(args, "expert_gate_up_bits", 2)
             result = {}
-            result.update(
-                _quantized_entries(
-                    f"{prefix}.gate_proj",
-                    gate,
-                    "t5",
-                    2,
-                    T5_GROUP_SIZE,
-                    args,
-                    per_layer,
-                    importance=_importance_for(args, name, gate, projection="gate"),
+            for suffix, half, imatrix_projection in (
+                ("gate_proj", gate, "gate"),
+                ("up_proj", up, "up"),
+            ):
+                result.update(
+                    _quantized_entries(
+                        f"{prefix}.{suffix}",
+                        half,
+                        kind,
+                        bits,
+                        EXPERT_GROUP_SIZE,
+                        args,
+                        per_layer,
+                        importance=_importance_for(
+                            args, name, half, projection=imatrix_projection
+                        ),
+                    )
                 )
-            )
-            result.update(
-                _quantized_entries(
-                    f"{prefix}.up_proj",
-                    up,
-                    "t5",
-                    2,
-                    T5_GROUP_SIZE,
-                    args,
-                    per_layer,
-                    importance=_importance_for(args, name, up, projection="up"),
-                )
-            )
             return result
         return _quantized_entries(
             f"{prefix}.down_proj",
             tensor,
             "affine",
-            2,
-            T5_GROUP_SIZE,
+            getattr(args, "expert_down_bits", 2),
+            EXPERT_GROUP_SIZE,
             args,
             per_layer,
             importance=_importance_for(args, name, tensor),
@@ -585,13 +689,16 @@ def transform(name: str, tensor, args, per_layer: dict[str, dict[str, Any]]):
 
     out_name = runtime_name(name)
     if _PLE_RE.search(name):
-        return _quantized_entries(module_name(out_name), tensor, "affine", getattr(args, "ple_bits", PLE_BITS), PLE_GROUP_SIZE, args, per_layer)
+        return _quantized_entries(
+            module_name(out_name), tensor, "affine", getattr(args, "ple_bits", PLE_BITS),
+            PLE_GROUP_SIZE, args, per_layer, clip_search=False,
+        )
 
     # qwen4_exp conv kernels use [out, kernel, in] in the MLX runtime.
     if "conv1d.weight" in out_name and tensor.shape[-1] != 1:
         tensor = tensor.movedim(2, 1).contiguous()
 
-    spec = quant_spec(out_name, tensor)
+    spec = quant_spec(out_name, tensor, vision_bits=getattr(args, "vision_bits", 0))
     if spec is None:
         return {out_name: tensor}
     kind, bits, group_size = spec
@@ -614,6 +721,8 @@ def normalize_config(
     config: dict[str, Any],
     per_layer: dict[str, dict[str, Any]],
     imatrix_summary: dict[str, Any] | None = None,
+    *,
+    expert_format: str = EXPERT_FORMAT,
 ) -> dict[str, Any]:
     output = json.loads(json.dumps(config))
     tc = output.get("text_config") or {}
@@ -623,6 +732,10 @@ def normalize_config(
     quant.update(dict(sorted(per_layer.items())))
     output["quantization"] = quant
     output["quantization_config"] = quant
+    if expert_format != "t5":
+        # Plain affine experts need no loader marker; keep the config clean
+        # for stock oMLX.
+        return output
     output["omlx_t5"] = {
         "format": "base3_5trits_per_byte",
         "group_size": T5_GROUP_SIZE,
@@ -658,11 +771,26 @@ def write_artifact_metadata(
     verification: dict[str, Any],
     imatrix_summary: dict[str, Any] | None = None,
     t5_fitter: str = T5_FITTER,
+    *,
+    expert_format: str = EXPERT_FORMAT,
+    expert_gate_up_bits: int = 2,
+    expert_down_bits: int = 2,
+    imatrix_scope: str = IMATRIX_SCOPE,
+    clip_search: bool = False,
+    vision_bits: int = 0,
 ) -> None:
     revision = source.name if re.fullmatch(r"[0-9a-f]{40}", source.name) else None
     portable_verification = {
         key: value for key, value in verification.items() if key != "checkpoint"
     }
+    t5 = expert_format == "t5"
+    search_suffix = "_range_search" if clip_search else ""
+    routed_gate_up = (
+        f"bonsai_t5_group_128_{t5_fitter}_weighted_ls"
+        if t5
+        else f"affine_q{expert_gate_up_bits}_group_128{search_suffix}"
+    )
+    routed_down = f"affine_q{expert_down_bits}_group_128{search_suffix}"
     report = {
         "schema_version": 1,
         "created_utc": datetime.now(UTC).isoformat(),
@@ -672,17 +800,23 @@ def write_artifact_metadata(
         "converted_shard_bytes": verification["bytes"],
         "verification": portable_verification,
         "recipe": {
-            "routed_gate_up": f"bonsai_t5_group_128_{t5_fitter}_weighted_ls",
-            "t5_fitter": t5_fitter,
-            "routed_down": "affine_q2_group_128",
+            "expert_format": expert_format,
+            "routed_gate_up": routed_gate_up,
+            "t5_fitter": t5_fitter if t5 else None,
+            "routed_down": routed_down,
+            "affine_range_search": clip_search,
             "ple_ngram_embedding": f"affine_q{verification['ple_bits']}_group_32_ssd_mmap",
             "shared_experts": "affine_q8_group_128",
             "shared_expert_gate": "affine_q8_group_64",
             "attention_and_deltanet_projections": "affine_q5_group_64_except_self_attn_o_proj_q4_group_64",
             "token_embedding_and_lm_head": "affine_q6_group_64",
             "default_eligible_matrix": "affine_q4_group_64",
+            "vision_tower": (
+                f"affine_q{vision_bits}_group_64_linear_layers_only" if vision_bits else "bf16"
+            ),
             "mtp": "removed",
             "importance_matrix": imatrix_summary,
+            "imatrix_scope": imatrix_scope if imatrix_summary is not None else None,
         },
         "validation_status": "structural_only_windows; Apple Silicon runtime pending",
     }
@@ -696,15 +830,68 @@ def write_artifact_metadata(
     mmap_gib = verification["mmap_estimate_bytes"] / 1024**3
     if imatrix_summary is None:
         importance_line = "- no importance matrix was used."
-        t5_line = f"weight-only weighted least-squares scale ({t5_fitter} fitter)"
+        weighting = "weight-only"
     else:
         importance_line = (
             "- activation importance: llama.cpp GGUF imatrix "
-            f"`{imatrix_summary['file']}` (`{imatrix_summary['sha256']}`), with "
+            f"`{imatrix_summary['file']}` (`{imatrix_summary['sha256']}`), scope "
+            f"`{imatrix_scope}`, with "
             f"{imatrix_summary['zero_count_experts_imputed']} unobserved routed "
             "expert slots imputed from observed experts."
         )
-        t5_line = "activation-imatrix weighted least-squares scale"
+        weighting = "activation-imatrix"
+    if t5:
+        title = "Qwen3.8-Flash-Next MLX T5 experiment"
+        gate_up_line = (
+            f"- routed gate/up: Bonsai base-3 T5, group 128, {weighting} weighted "
+            f"least-squares scale ({t5_fitter} fitter);"
+        )
+        expert_summary = (
+            "compressing routed gate/up experts below two bits per weight. Including the\n"
+            f"q{expert_down_bits} down projection and scale/bias metadata, routed experts "
+            "average about two\nbits per weight on disk."
+        )
+        runtime_section = """## Runtime requirement
+
+This checkpoint requires the matching experimental OMLX branch with routed
+rank-3 T5 support and its native Bonsai Metal kernel. A stock OMLX build cannot
+run the T5 expert banks. See `omlx_conversion.json` for the conversion record;
+the OMLX fork/commit will be added after publication.
+"""
+        format_note = """The T5 representation adapts an AngelSlim-inspired weighted least-squares idea
+to OMLX's existing base-3 format. It is not the exact AngelSlim STQ1_0 3:4
+layout.
+"""
+    else:
+        title = "Qwen3.8-Flash-Next MLX affine experiment"
+        gate_up_line = (
+            f"- routed gate/up: affine q{expert_gate_up_bits}/group 128, {weighting} "
+            f"{'range search' if clip_search else 'min/max range'};"
+        )
+        expert_summary = (
+            f"storing routed experts as plain MLX affine q{expert_gate_up_bits} "
+            f"(gate/up) and q{expert_down_bits} (down), group 128."
+        )
+        runtime_section = """## Runtime requirement
+
+This checkpoint uses only stock MLX affine quantization plus oMLX's Qwen4-Exp
+PLE SSD offload. It needs an oMLX build with Qwen4-Exp support, but no
+experimental kernels, loader patches or the Bonsai extension. See
+`omlx_conversion.json` for the conversion record.
+"""
+        format_note = ""
+    search_line = (
+        "- affine tensors: importance-weighted range search over both edges, "
+        "evaluated with the stored BF16 scale/bias;\n"
+        if clip_search
+        else ""
+    )
+    vision_line = (
+        f"- vision-tower Linear layers: q{vision_bits}/group 64 (patch embed, positional "
+        "embedding, norms, biases and widths not divisible by 64 stay BF16);"
+        if vision_bits
+        else "- vision tower: BF16;"
+    )
     card = f"""---
 base_model: {EXPECTED_REPO}
 library_name: mlx
@@ -718,14 +905,12 @@ tags:
   - experimental
 ---
 
-# Qwen3.8-Flash-Next MLX T5 experiment
+# {title}
 
 This is an experimental OMLX checkpoint derived from
 [{EXPECTED_REPO}](https://huggingface.co/{EXPECTED_REPO}) at `{revision_text}`.
 It targets a 48 GB M3 Max by keeping Qwen4 PLE n-gram embeddings SSD-mmaped and
-compressing routed gate/up experts below two bits per weight. Including the
-q2 down projection and scale/bias metadata, routed experts average about two
-bits per weight on disk.
+{expert_summary}
 
 This artifact has passed CUDA-side packing tests and complete structural
 checkpoint verification on Windows. It has **not yet been validated for model
@@ -739,26 +924,18 @@ ceiling. This is a header-based estimate, not a measured Mac peak.
 
 ## Precision policy
 
-- routed gate/up: Bonsai base-3 T5, group 128, {t5_line};
-- routed down: affine q2/group 128;
+{gate_up_line}
+- routed down: affine q{expert_down_bits}/group 128;
 - PLE n-gram embeddings: affine q{verification['ple_bits']}/group 32 and separately mmap-able;
 - shared experts: q8; attention/DeltaNet projections: q5 except QSA o_proj (q4);
 - token embeddings/LM head: q6; other eligible matrices: q4;
-- vision, router/state, convolution, and norm tensors: BF16;
+{vision_line}
+- router/state, convolution, and norm tensors: BF16;
 - MTP removed for the first memory target;
-{importance_line}
+{search_line}{importance_line}
 
-The T5 representation adapts an AngelSlim-inspired weighted least-squares idea
-to OMLX's existing base-3 format. It is not the exact AngelSlim STQ1_0 3:4
-layout.
-
-## Runtime requirement
-
-This checkpoint requires the matching experimental OMLX branch with routed
-rank-3 T5 support and its native Bonsai Metal kernel. A stock OMLX build cannot
-run the T5 expert banks. See `omlx_conversion.json` for the conversion record;
-the OMLX fork/commit will be added after publication.
-
+{format_note}
+{runtime_section}
 ## Verification
 
 ```bash
@@ -769,6 +946,24 @@ The base model and tokenizer remain subject to the upstream model card and
 Apache-2.0 license.
 """
     (output / "README.md").write_text(card, encoding="utf-8")
+
+
+def expected_expert_layout(projection: str, *, t5: bool, bits, group_size):
+    """Stored shapes for one routed projection under its declared precision."""
+    rows, width = (640, 2560) if projection in {"gate_proj", "up_proj"} else (2560, 640)
+    params = (512, rows, width // EXPERT_GROUP_SIZE)
+    if t5:
+        if (bits, group_size) != (2, EXPERT_GROUP_SIZE):
+            raise ValueError(
+                f"{projection}: T5 banks must carry the q2/group-128 placeholder declaration"
+            )
+        return (512, rows, (width // EXPERT_GROUP_SIZE) * 26), "U8", params
+    if bits not in EXPERT_BITS_CHOICES or group_size != EXPERT_GROUP_SIZE:
+        raise ValueError(
+            f"{projection}: expected an affine q2/q3 group-128 declaration, "
+            f"got bits={bits!r} group_size={group_size!r}"
+        )
+    return (512, rows, width * bits // 32), "U32", params
 
 
 def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
@@ -785,8 +980,10 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
     validate_config(config)
     if (config.get("text_config") or {}).get("mtp_num_hidden_layers") != 0:
         raise ValueError("converted config must disable MTP")
-    if (config.get("omlx_t5") or {}).get("format") != "base3_5trits_per_byte":
-        raise ValueError("converted config is missing the OMLX T5 declaration")
+    t5_declared = (config.get("omlx_t5") or {}).get("format") == "base3_5trits_per_byte"
+    if "omlx_t5" in config and not t5_declared:
+        raise ValueError("converted config carries an unrecognised OMLX T5 declaration")
+    quantization = config.get("quantization") or {}
 
     index = json.loads(index_path.read_text(encoding="utf-8"))
     indexed = index.get("weight_map") or {}
@@ -835,6 +1032,7 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
         "up_proj": set(),
         "down_proj": set(),
     }
+    expert_precision: dict[str, set[str]] = {key: set() for key in expert_layers}
     for key in observed:
         match = _RUNTIME_EXPERT_RE.match(key)
         if match is None:
@@ -844,14 +1042,15 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
         expert_layers[projection].add(layer)
         base = module_name(key)
         weight_shape, weight_dtype = tensor_meta[key]
-        if projection in {"gate_proj", "up_proj"}:
-            expected_weight = (512, 640, 520)
-            expected_params = (512, 640, 20)
-            expected_dtype = "U8"
-        else:
-            expected_weight = (512, 2560, 40)
-            expected_params = (512, 2560, 5)
-            expected_dtype = "U32"
+        spec = quantization.get(base) or {}
+        t5_projection = t5_declared and projection in {"gate_proj", "up_proj"}
+        expected_weight, expected_dtype, expected_params = expected_expert_layout(
+            projection,
+            t5=t5_projection,
+            bits=spec.get("bits"),
+            group_size=spec.get("group_size"),
+        )
+        expert_precision[projection].add("t5" if t5_projection else f"q{spec.get('bits')}")
         if (weight_shape, weight_dtype) != (expected_weight, expected_dtype):
             raise ValueError(
                 f"{key}: got shape/dtype {weight_shape}/{weight_dtype}, "
@@ -900,6 +1099,10 @@ def verify_checkpoint(checkpoint: Path) -> dict[str, Any]:
         "shards": len(shard_names),
         "tensors": len(observed),
         "bytes": actual_bytes,
+        "expert_format": "t5" if t5_declared else "affine",
+        "expert_precision": {
+            key: sorted(values) for key, values in expert_precision.items()
+        },
         "expert_layers": 48,
         "ple_weight_shards": len(ple_weights),
         "ple_bytes": ple_bytes,
@@ -948,6 +1151,13 @@ def convert(args) -> None:
         raise ValueError("Source and output directories must be separate, not nested")
     config = json.loads((source / "config.json").read_text(encoding="utf-8"))
     validate_config(config)
+    if imatrix is not None:
+        text_config = config["text_config"]
+        imatrix.configure_linear_attention(
+            text_config["linear_num_key_heads"],
+            text_config["linear_num_value_heads"],
+            text_config["linear_value_head_dim"],
+        )
     index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
     shards = sorted(set(index["weight_map"].values()))
     identity = conversion_identity(source, shards, args)
@@ -1006,15 +1216,20 @@ def convert(args) -> None:
         if key.endswith(".weight") and ".switch_mlp." in key:
             base = module_name(key)
             if base.endswith(("gate_proj", "up_proj")):
-                per_layer[base] = {"bits": 2, "group_size": T5_GROUP_SIZE, "mode": "affine"}
+                bits = 2 if args.expert_format == "t5" else args.expert_gate_up_bits
+                per_layer[base] = {"bits": bits, "group_size": EXPERT_GROUP_SIZE, "mode": "affine"}
             elif base.endswith("down_proj"):
-                per_layer[base] = {"bits": 2, "group_size": T5_GROUP_SIZE, "mode": "affine"}
+                per_layer[base] = {
+                    "bits": args.expert_down_bits,
+                    "group_size": EXPERT_GROUP_SIZE,
+                    "mode": "affine",
+                }
         if ".ngram_embedding.shards." in key and key.endswith(".weight"):
             per_layer[module_name(key)] = {"bits": args.ple_bits, "group_size": PLE_GROUP_SIZE, "mode": "affine"}
             continue
         if ".switch_mlp." in key:
             continue
-        spec = quant_spec(key, SimpleNamespace(ndim=2))
+        spec = quant_spec(key, SimpleNamespace(ndim=2), vision_bits=args.vision_bits)
         if spec is not None:
             _, bits, group_size = spec
             if bits != BASE_QUANT["bits"] or group_size != BASE_QUANT["group_size"]:
@@ -1037,7 +1252,12 @@ def convert(args) -> None:
     imatrix_summary = imatrix.summary() if imatrix is not None else None
     (output / "config.json").write_text(
         json.dumps(
-            normalize_config(config, per_layer, imatrix_summary),
+            normalize_config(
+                config,
+                per_layer,
+                imatrix_summary,
+                expert_format=args.expert_format,
+            ),
             indent=2,
             ensure_ascii=False,
         ),
@@ -1048,6 +1268,12 @@ def convert(args) -> None:
     write_artifact_metadata(
         source, output, shards, verification, imatrix_summary=imatrix_summary,
         t5_fitter=args.t5_fitter,
+        expert_format=args.expert_format,
+        expert_gate_up_bits=args.expert_gate_up_bits,
+        expert_down_bits=args.expert_down_bits,
+        imatrix_scope=args.imatrix_scope,
+        clip_search=resolve_clip_search(args),
+        vision_bits=args.vision_bits,
     )
     print(f"complete: {output}", flush=True)
 
@@ -1085,6 +1311,8 @@ def convert_single_shard(args) -> None:
         args.device,
         args.validation_experts,
         imatrix=imatrix,
+        expert_format=args.expert_format,
+        gate_up_bits=args.expert_gate_up_bits,
     )
     print(
         json.dumps(
@@ -1097,6 +1325,8 @@ def convert_single_shard(args) -> None:
                 "tensors": {key: list(value.shape) for key, value in emitted.items()},
                 "per_layer": per_layer,
                 "t5_fitter": args.t5_fitter,
+                "expert_format": args.expert_format,
+                "clip_search": resolve_clip_search(args),
                 "imatrix": imatrix.summary() if imatrix is not None else None,
                 "validation": validation,
             },
@@ -1112,8 +1342,11 @@ def validate_expert_shard(
     device: str,
     sample_experts: int,
     imatrix=None,
+    expert_format: str = EXPERT_FORMAT,
+    gate_up_bits: int = 2,
 ):
-    """Measure t5 error on real gate/up rows from a fused expert shard."""
+    """Measure routed gate/up error on real rows from a fused expert shard."""
+    label = "t5" if expert_format == "t5" else f"q{gate_up_bits}"
     torch = _torch()
     from safetensors import safe_open
 
@@ -1141,11 +1374,19 @@ def validate_expert_shard(
             base = f"{prefix}.{projection}"
             packed = quantized.get_slice(f"{base}.weight")[:sample_experts].to(device)
             scales = quantized.get_slice(f"{base}.scales")[:sample_experts].to(device).float()
-            codes = unpack_t5(packed, reference.shape[-1]).to(device).float()
-            reconstructed = (
-                (codes.reshape(*reference.shape[:-1], -1, T5_GROUP_SIZE) - 1.0)
-                * scales.reshape(*reference.shape[:-1], -1, 1)
-            ).reshape_as(reference)
+            scales = scales.reshape(*reference.shape[:-1], -1, 1)
+            if expert_format == "t5":
+                codes = unpack_t5(packed, reference.shape[-1]).to(device).float()
+                reconstructed = (
+                    (codes.reshape(*reference.shape[:-1], -1, T5_GROUP_SIZE) - 1.0) * scales
+                ).reshape_as(reference)
+            else:
+                biases = quantized.get_slice(f"{base}.biases")[:sample_experts].to(device).float()
+                biases = biases.reshape(*reference.shape[:-1], -1, 1)
+                codes = unpack_affine(packed, reference.shape[-1], gate_up_bits).to(device).float()
+                reconstructed = (
+                    codes.reshape(*reference.shape[:-1], -1, EXPERT_GROUP_SIZE) * scales + biases
+                ).reshape_as(reference)
             error = reconstructed - reference
             q2_weight, q2_scales, q2_biases = affine_chunk(
                 reference, bits=2, group_size=T5_GROUP_SIZE
@@ -1159,12 +1400,12 @@ def validate_expert_shard(
             q2_error = q2_reconstructed - reference
             metrics[projection] = {
                 "sample_experts": sample_experts,
-                "t5_rmse": error.square().mean().sqrt().item(),
-                "t5_relative_rmse": (torch.linalg.vector_norm(error) / torch.linalg.vector_norm(reference)).item(),
-                "t5_cosine": torch.nn.functional.cosine_similarity(
+                f"{label}_rmse": error.square().mean().sqrt().item(),
+                f"{label}_relative_rmse": (torch.linalg.vector_norm(error) / torch.linalg.vector_norm(reference)).item(),
+                f"{label}_cosine": torch.nn.functional.cosine_similarity(
                     reconstructed.flatten(), reference.flatten(), dim=0
                 ).item(),
-                "t5_max_abs_error": error.abs().amax().item(),
+                f"{label}_max_abs_error": error.abs().amax().item(),
                 "q2_rmse": q2_error.square().mean().sqrt().item(),
                 "q2_relative_rmse": (torch.linalg.vector_norm(q2_error) / torch.linalg.vector_norm(reference)).item(),
                 "q2_cosine": torch.nn.functional.cosine_similarity(
@@ -1313,6 +1554,38 @@ def self_test(device: str, t5_fitter: str = T5_FITTER) -> None:
     ple_key = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight"
     if ple_out[ple_key].shape != (3, 40) or ple_out[ple_key].dtype != torch.uint32:
         raise AssertionError("PLE q8/group-32 shape/dtype mismatch")
+    affine_args = SimpleNamespace(
+        device=device, chunk_rows=8, t5_fitter=t5_fitter, expert_format="affine",
+        expert_gate_up_bits=2, expert_down_bits=3, clip_search=None,
+    )
+    affine_config: dict[str, dict[str, Any]] = {}
+    affine_out = transform(
+        "model.language_model.layers.0.mlp.experts.gate_up_proj",
+        tiny_expert,
+        affine_args,
+        affine_config,
+    )
+    if affine_out[gate_key].shape != (2, 128, 16) or affine_out[gate_key].dtype != torch.uint32:
+        raise AssertionError("affine routed expert shape/dtype mismatch")
+    tiny_down = torch.randn((2, 256, 256), generator=generator, dtype=torch.bfloat16)
+    down_key = "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight"
+    down_out = transform(
+        "model.language_model.layers.0.mlp.experts.down_proj", tiny_down, affine_args, affine_config
+    )
+    if down_out[down_key].shape != (2, 256, 24) or affine_config[module_name(down_key)]["bits"] != 3:
+        raise AssertionError("affine q3 down projection shape/declaration mismatch")
+    if "omlx_t5" in normalize_config({"text_config": {}}, affine_config, expert_format="affine"):
+        raise AssertionError("affine conversion must not declare the T5 loader marker")
+    heavy = torch.randn((16, 256), generator=generator) * torch.tensor([1.0] * 255 + [12.0])
+    heavy = heavy.to(device)
+
+    def _sse(result):
+        unpacked = unpack_affine(result[0], 256, 2).float().reshape(16, 2, 128)
+        rebuilt = unpacked * result[1].float().reshape(16, 2, 1) + result[2].float().reshape(16, 2, 1)
+        return (rebuilt.reshape(16, 256) - heavy).square().sum().item()
+
+    if not _sse(affine_chunk(heavy, 2, 128, clip_search=True)) < 0.9 * _sse(affine_chunk(heavy, 2, 128)):
+        raise AssertionError("affine range search failed to improve a heavy-tailed fixture")
     try:
         from safetensors import safe_open
         from safetensors.torch import save_file
@@ -1340,7 +1613,21 @@ def parse_args(argv=None):
     parser.add_argument("--ple-bits", type=int, choices=(2, 8), default=PLE_BITS,
                         help="SSD-backed ngram precision (default 8; 2 only for historical A/B controls)")
     parser.add_argument("--t5-fitter", choices=("legacy", "prefix"), default=T5_FITTER,
-                        help="Weight-only T5 scale solver (default prefix; legacy reproduces the original fitter)")
+                        help="T5 scale solver (default prefix; legacy reproduces the original fitter); both accept --imatrix")
+    parser.add_argument("--expert-format", choices=EXPERT_FORMATS, default=EXPERT_FORMAT,
+                        help="Routed expert storage: Bonsai t5 gate/up (fork runtime) or plain MLX affine (stock oMLX)")
+    parser.add_argument("--expert-gate-up-bits", type=int, choices=EXPERT_BITS_CHOICES, default=2,
+                        help="Affine routed gate/up precision, group 128 (affine format only)")
+    parser.add_argument("--expert-down-bits", type=int, choices=EXPERT_BITS_CHOICES, default=2,
+                        help="Routed down precision, group 128 (default 2)")
+    parser.add_argument("--imatrix-scope", choices=IMATRIX_SCOPES, default=IMATRIX_SCOPE,
+                        help="Tensors that take imatrix weighting: safe (experts plus verified hidden-input projections), experts, or all")
+    parser.add_argument("--vision-bits", type=int, choices=VISION_BITS_CHOICES, default=0,
+                        help="Quantize vision-tower Linear layers (0 keeps the ViT in BF16)")
+    parser.add_argument("--clip-search", dest="clip_search", action="store_true", default=None,
+                        help="Importance-weighted affine range search (default on for --expert-format affine)")
+    parser.add_argument("--no-clip-search", dest="clip_search", action="store_false",
+                        help="Plain min/max affine ranges (the historical T5 recipe default)")
     parser.add_argument("--allow-experimental-imatrix", action="store_true",
                         help="Explicitly opt into the parked, unvalidated imatrix experiment (known DeltaNet channel-order issue)")
     parser.add_argument(
@@ -1385,10 +1672,12 @@ def parse_args(argv=None):
         parser.error("--output is required unless --self-test is used")
     if args.imatrix_strict and args.imatrix is None:
         parser.error("--imatrix-strict requires --imatrix")
-    if args.imatrix is not None and not args.allow_experimental_imatrix:
-        parser.error("Imatrix is parked: known DeltaNet channel-order issue; experimental use requires --allow-experimental-imatrix")
-    if args.imatrix is not None and args.t5_fitter != "legacy":
-        parser.error("Prefix fitting is weight-only; experimental imatrix also requires --t5-fitter legacy")
+    if args.expert_format == "t5" and args.expert_gate_up_bits != 2:
+        parser.error("--expert-gate-up-bits applies only to --expert-format affine")
+    if args.imatrix is not None and not args.allow_experimental_imatrix and (
+        args.expert_format == "t5" or args.imatrix_scope == "all"
+    ):
+        parser.error("Imatrix with T5 experts or --imatrix-scope all is parked (known DeltaNet channel-order issue); requires --allow-experimental-imatrix")
     if args.chunk_rows <= 0 or args.validation_experts <= 0:
         parser.error("--chunk-rows and --validation-experts must be positive")
     if args.resume and args.model is None:
