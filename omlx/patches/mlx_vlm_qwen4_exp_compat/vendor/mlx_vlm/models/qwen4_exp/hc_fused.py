@@ -1,32 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused hyper-connection kernels for Qwen4-Exp decode and verify rows.
+"""Three Metal kernels for small Qwen4 hyper-connection inputs.
 
-``Qwen4ExpGatedResidual._forward`` builds ~30 MLX nodes per call (grouped norm,
-three small quantized projections, silu/sigmoid gates, stream mix and mean) and
-runs 97 times per forward. On Apple Silicon the host-side kernel encoding of
-that graph, not its GPU time, dominates a Lightning MTP verify cycle. Three
-row-batched Metal kernels replace it for small row counts:
+Fuses per-stream RMS norm, down/inject projections with activation, and the up
+projection with stream mixing. Supports at most 16 BF16 rows, four streams,
+and affine group-size-64 projections with 4/5/6/8-bit weights. FP32 epilogues
+can round differently from the canonical BF16 operations.
 
-* ``N`` -- per-stream RMS norm with the ``1 + weight`` scale (bit-identical to
-  ``mx.fast.rms_norm``).
-* ``D`` -- ``input_mix_weight_down`` (320 rows) and ``block_inject_weight``
-  (``hc_count`` rows) projections per token row, split over 4 K-slices, with
-  the ``silu(mix / hc_count)`` and ``2 * sigmoid(inject / hc_count)``
-  epilogues folded in.
-* ``U`` -- ``input_mix_weight_up`` per output element, sigmoid, times the
-  normed stream, mean over streams via simd shuffles.
-
-Rows live in the grid (``batch * seq <= 16``); within that limit the fused path
-runs ahead of upstream's exact hybrid projection and compiled single-token path
-(serial decode) as well as the canonical path (MTP verify). The affine unpack
-helpers come from :mod:`hc_projection`. Any ``hidden_size`` that is a multiple of 64 is
-supported: the norm, down and inject loops guard their partial final blocks
-(compiled out for the shipped 2560). Results match the canonical path to a few
-bf16 ULP (fp32 is kept through the epilogues); the path fails closed to
-``_forward`` on any runtime error and logs once when a model's layout keeps it
-on the canonical path. Experimental opt-in: ``OMLX_QWEN4_HC_FUSED=1``.
-Only graph-construction errors can fall back here; asynchronous execution
-failures must stop validation rather than being reported as a successful fallback.
+Each kernel specialization is evaluated once inside the failure handler to
+catch lazy compilation errors. Later calls stay lazy; errors during their
+external evaluation propagate to the caller. Disable with OMLX_QWEN4_HC_FUSED=0.
 """
 
 from __future__ import annotations
@@ -44,10 +26,14 @@ logger = logging.getLogger(__name__)
 MAX_ROWS = 16
 _GROUP_SIZE = 64
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "0").strip().lower() not in {
-    "1", "true", "yes", "on",
+_DISABLED = os.environ.get("OMLX_QWEN4_HC_FUSED", "1").strip().lower() in {
+    "0",
+    "false",
+    "no",
+    "off",
 }
 _KERNELS: dict[str, object] = {}
+_VALIDATED: set[tuple] = set()
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
 _INELIGIBLE_LOGGED = False
@@ -125,9 +111,7 @@ _D_SOURCE = r"""
             bp += BLOCK / 64;
             xp += BLOCK;
         }
-        // Partial final block: only lanes whose VPT elements lie inside the slice take part.
-        // The helpers read exactly VPT values and VPT * BITS / 8 weight bytes, so nothing is
-        // touched past the slice; every lane still joins the simd_sum below.
+        // Load only lanes inside the tail; all lanes must join simd_sum.
         if (TAIL > 0 && int(lane) * VPT < TAIL) {
             float sum = hc_load_vector<T, VPT, BITS_D>(xp, xv);
             for (int r = 0; r < 4; ++r) {
@@ -151,11 +135,8 @@ _D_SOURCE = r"""
         }
         return;
     }
-    if (INJ == 0) return;
+    if (INJ == 0 || rg != 0) return;
     {
-        // All eight simdgroups must reach the threadgroup barrier below.
-        // Only even simdgroups compute injection, but odd ones cannot return early.
-        if (rg == 0) {
         constexpr int PF = hc_pack_factor<BITS_I>();
         constexpr int BP = hc_bytes_per_pack<BITS_I>();
         constexpr int ROW_BYTES = K * BP / PF;
@@ -194,7 +175,6 @@ _D_SOURCE = r"""
         for (int r = 0; r < HC; ++r) {
             float v = simd_sum(result[r]);
             if (lane == 0) part[ks][r] = v;
-        }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0 && lane < HC) {
@@ -243,7 +223,13 @@ _U_SOURCE = r"""
 """
 
 
-def _kernel(name: str, input_names: list[str], output_names: list[str], source: str, header: str = ""):
+def _kernel(
+    name: str,
+    input_names: list[str],
+    output_names: list[str],
+    source: str,
+    header: str = "",
+):
     kernel = _KERNELS.get(name)
     if kernel is None:
         kernel = mx.fast.metal_kernel(
@@ -262,7 +248,7 @@ def enabled() -> bool:
     return not _DISABLED and not _RUNTIME_FAILED
 
 
-def _quantized_ok(projection, input_dim: int, output_dim: int) -> bool:
+def _quantized_ok(projection) -> bool:
     return (
         type(projection) is nn.QuantizedLinear
         and getattr(projection, "group_size", None) == _GROUP_SIZE
@@ -275,15 +261,11 @@ def _quantized_ok(projection, input_dim: int, output_dim: int) -> bool:
         and isinstance(getattr(projection, "biases", None), mx.array)
         and projection.scales.dtype == mx.bfloat16
         and projection.biases.dtype == mx.bfloat16
-        and projection.weight.shape == (output_dim, input_dim * projection.bits // 32)
-        and projection.scales.shape == (output_dim, input_dim // _GROUP_SIZE)
-        and projection.biases.shape == projection.scales.shape
     )
 
 
 def _ineligible(reason: str) -> bool:
-    """Record (once per process) why a model stays on the canonical path, so a future
-    checkpoint that misses the fused kernels shows up in the log instead of just running slower."""
+    """Log the first unsupported model layout per process."""
     global _INELIGIBLE_LOGGED
     if not _INELIGIBLE_LOGGED:
         _INELIGIBLE_LOGGED = True
@@ -306,12 +288,6 @@ def compatible(module, hyper_input) -> bool:
         and 1 <= hyper_input.shape[0] * hyper_input.shape[1] <= MAX_ROWS
     ):
         return False
-    # With Lightning MTP off, load_weights installs upstream's exact hybrid projection
-    # (``_omlx_exact_hybrid_projection``) and compiles ``_forward`` for single-token
-    # decode. The fused path deliberately takes precedence over both: three kernels
-    # per module against a compiled call plus its own kernels measured +12..14%
-    # serial tok/s on the M5 Max. ``_forward`` keeps the hybrid for the rows this
-    # path does not take.
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
@@ -322,14 +298,9 @@ def compatible(module, hyper_input) -> bool:
         and isinstance(hidden, int)
         and isinstance(lowrank, int)
         and hc_count == 4
-        and hidden > 0
-        and lowrank > 0
-        # Every kernel walks the hidden axis in 64-element quantisation groups (the up
-        # kernel's grid is hidden // 64); the norm, down and inject loops guard their
-        # partial final blocks, so any multiple of 64 is fine.
+        # The up grid and quantization groups require 64-element alignment.
         and hidden % 64 == 0
         and lowrank % 64 == 0
-        and lowrank % 8 == 0
         and hyper_input.shape[2] == hc_count * hidden
     ):
         return _ineligible(
@@ -345,13 +316,15 @@ def compatible(module, hyper_input) -> bool:
     ):
         return _ineligible("hc_norm layout")
     if not (
-        _quantized_ok(getattr(module, "input_mix_weight_down", None), hc_count * hidden, lowrank)
-        and _quantized_ok(getattr(module, "input_mix_weight_up", None), lowrank, hc_count * hidden)
+        _quantized_ok(getattr(module, "input_mix_weight_down", None))
+        and _quantized_ok(getattr(module, "input_mix_weight_up", None))
     ):
         return _ineligible(
             "projection quantisation (need affine group-size-64 4/5/6/8-bit with bf16 scales)"
         )
-    if "block_inject_weight" in module and not _quantized_ok(module.block_inject_weight, hc_count * hidden, hc_count):
+    if "block_inject_weight" in module and not _quantized_ok(
+        module.block_inject_weight
+    ):
         return _ineligible("block_inject_weight quantisation")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
@@ -366,7 +339,7 @@ def _eps_array(module) -> mx.array:
 
 
 def fused_forward(module, hyper_input):
-    """Fused equivalent of ``Qwen4ExpGatedResidual._forward``; ``None`` on runtime failure."""
+    """Return fused outputs, or None on construction or first-evaluation failure."""
     global _RUNTIME_FAILED, _FAILURE_LOGGED
     try:
         hc, hidden, lowrank = module.hc_count, module.hidden_size, module.hc_lowrank
@@ -386,7 +359,9 @@ def fused_forward(module, hyper_input):
             threadgroup=(256, 1, 1),
             output_shapes=[(rows, width)],
             output_dtypes=[dtype],
-        )[0]
+        )[
+            0
+        ]
         if inject is not None:
             inject_tensors = (inject.weight, inject.scales, inject.biases)
         else:
@@ -434,7 +409,27 @@ def fused_forward(module, hyper_input):
             threadgroup=(256, 1, 1),
             output_shapes=[(rows, hidden)],
             output_dtypes=[dtype],
-        )[0]
+        )[
+            0
+        ]
+        signature = (
+            dtype,
+            hc,
+            hidden,
+            lowrank,
+            rows,
+            down.bits,
+            up.bits,
+            inject.bits if inject is not None else None,
+        )
+        if signature not in _VALIDATED:
+            # Metal compilation is lazy. Validate once, without synchronizing
+            # subsequent layers or decode steps using the same specialization.
+            if inject is None:
+                mx.eval(mixed)
+            else:
+                mx.eval(mixed, injection)
+            _VALIDATED.add(signature)
         mixed = mixed.reshape(batch, seq, hidden)
         if inject is None:
             return mixed

@@ -1,8 +1,29 @@
 # Qwen3.8-Flash-Next T5 handoff
 
+Integration update (2026-09-08): the upstream merge incorporates
+`94530d8d49541ede9e99ef04a4431ee4953117a6` and includes the Mac fixes through
+`0820cfc96eefcea20d156b7058ea05cda5810c11`. By user decision, fused HC now
+matches upstream exactly: no local barrier correction or extra tensor-shape
+checks. HC fusion and eager dispatch default on (upstream disable switches
+remain); fast RMS uses upstream's unconditional implementation and the old
+`OMLX_QWEN4_FAST_RMS_NORM` variable has no effect. Historical default-off
+instructions below do not apply to these merged optimizations. Our separate
+PLE batched-gather experiment remains opt-in. T5 loading/kernels and Q8 PLE
+SSD offload remain intact. The barrier concern is not resolved by reverting
+to upstream; this is not a measured correctness or performance improvement.
+Native validation requires an isolated Mac environment and a fresh custom
+kernel build for the merged MLX 0.32.2 dependency; do not alter mainline omlx.
+Windows validation: 39 portable tests passed and all 150 changed Python files
+parsed successfully. Native focused tests were not run: the Windows converter
+environment has no pytest or native MLX/Metal runtime. These checks do not
+establish Mac numerical parity or speed.
+
 Latest candidate (2026-09-08): [Q8 MTP restoration](qwen4_mtp_q8.md).
 Separate augmented checkpoint; the measured no-MTP baseline is unchanged.
-Native MTP acceptance/parity/memory/speed are pending. KV-cache quantization
+Mac testing found deterministic greedy MTP divergence on Chinese, Copernicus
+and the long-prompt probe; head-loaded MTP-off controls matched the original
+baseline. MTP remains experimental and the upstream merge is not a confirmed
+fix. KV-cache quantization
 is parked for upstream; do not explore or change it as part of this work.
 
 Latest work (2026-09-07): [runtime tuning candidate and small evaluation loop](qwen4_flash_next_runtime_tuning.md).

@@ -27,25 +27,33 @@ def extract(path, names, namespace):
 
 class RuntimeSwitchTests(unittest.TestCase):
     def controls(self, value):
-        keys = ("OMLX_QWEN4_EAGER_DISPATCH", "OMLX_QWEN4_FAST_RMS_NORM", "OMLX_QWEN4_HC_FUSED")
+        keys = ("OMLX_QWEN4_EAGER_DISPATCH", "OMLX_QWEN4_HC_FUSED")
         env = {} if value is None else dict.fromkeys(keys, value)
         with patch.dict(os.environ, env, clear=True):
-            language = extract(VENDOR / "language.py", {"_EAGER_DISPATCH", "_FAST_RMS_NORM"}, {"os": os})
+            language = extract(VENDOR / "language.py", {"_EAGER_DISPATCH"}, {"os": os})
             hc = extract(VENDOR / "hc_fused.py", {"_DISABLED"}, {"os": os})
-        return language["_EAGER_DISPATCH"], language["_FAST_RMS_NORM"], not hc["_DISABLED"]
+        return language["_EAGER_DISPATCH"], not hc["_DISABLED"]
 
-    def test_unset_preserves_baseline(self):
-        self.assertEqual(self.controls(None), (False, False, False))
+    def test_unset_uses_upstream_enabled_defaults(self):
+        self.assertEqual(self.controls(None), (True, True))
 
     def test_explicit_opt_in(self):
         for value in ("1", "true", "YES", " on "):
             with self.subTest(value=value):
-                self.assertEqual(self.controls(value), (True, True, True))
+                self.assertEqual(self.controls(value), (True, True))
 
-    def test_invalid_and_false_values_stay_off(self):
-        for value in ("0", "false", "no", "off", "", "typo"):
+    def test_explicit_disable(self):
+        for value in ("0", "false", "no", "off"):
             with self.subTest(value=value):
-                self.assertEqual(self.controls(value), (False, False, False))
+                self.assertEqual(self.controls(value), (False, False))
+
+    def test_other_values_follow_upstream_enabled_semantics(self):
+        for value in ("", "typo"):
+            self.assertEqual(self.controls(value), (True, True))
+
+    def test_fast_rms_has_no_local_switch(self):
+        source = (VENDOR / "language.py").read_text(encoding="utf-8")
+        self.assertNotIn("_FAST_RMS_NORM", source)
 
 
 class Array:
@@ -79,26 +87,20 @@ class ProjectionLayoutTests(unittest.TestCase):
 
     def test_all_supported_packed_widths(self):
         for bits in (4, 5, 6, 8):
-            self.assertTrue(self.check(self.projection(bits), 10240, 320))
-
-    def test_wrong_shapes_fail_closed(self):
-        for name in ("weight", "scales", "biases"):
-            q = self.projection()
-            q[name].shape = (1,)
-            self.assertFalse(self.check(q, 10240, 320))
+            self.assertTrue(self.check(self.projection(bits)))
 
     def test_unsupported_layouts_fail_closed(self):
         for name, value in (("bits", 2), ("group_size", 128), ("mode", "mxfp4"), ("bias", Array((320,), "bf16"))):
             q = self.projection()
             q[name] = value
-            self.assertFalse(self.check(q, 10240, 320))
-        self.assertFalse(self.check(None, 10240, 320))
+            self.assertFalse(self.check(q))
+        self.assertFalse(self.check(None))
 
     def test_wrong_dtypes_fail_closed(self):
         for name in ("weight", "scales", "biases"):
             q = self.projection()
             q[name].dtype = "fp32"
-            self.assertFalse(self.check(q, 10240, 320))
+            self.assertFalse(self.check(q))
 
 
 if __name__ == "__main__":

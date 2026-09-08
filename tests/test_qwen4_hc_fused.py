@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused hyper-connection kernels: parity with the canonical path, eligibility, kill switch."""
+
 from __future__ import annotations
 
 import importlib
+from unittest.mock import Mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,10 +16,9 @@ from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 @pytest.fixture(autouse=True)
 def _vendored_qwen4(monkeypatch):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    from mlx_vlm.models.qwen4_exp import hc_fused, language
+    from mlx_vlm.models.qwen4_exp import hc_fused
     monkeypatch.setattr(hc_fused, "_DISABLED", False)
     monkeypatch.setattr(hc_fused, "_RUNTIME_FAILED", False)
-    monkeypatch.setattr(language, "_FAST_RMS_NORM", True)
 
 HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
@@ -33,30 +34,46 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN):
     module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
     module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
     module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(mx.bfloat16)
-    module.input_mix_weight_down = nn.QuantizedLinear(width, LOWRANK, bias=False, group_size=64, bits=bits)
-    module.input_mix_weight_up = nn.QuantizedLinear(LOWRANK, width, bias=False, group_size=64, bits=bits)
+    module.input_mix_weight_down = nn.QuantizedLinear(
+        width, LOWRANK, bias=False, group_size=64, bits=bits
+    )
+    module.input_mix_weight_up = nn.QuantizedLinear(
+        LOWRANK, width, bias=False, group_size=64, bits=bits
+    )
     if use_combine:
-        module.block_inject_weight = nn.QuantizedLinear(width, HC, bias=False, group_size=64, bits=bits)
+        module.block_inject_weight = nn.QuantizedLinear(
+            width, HC, bias=False, group_size=64, bits=bits
+        )
     for name in ("input_mix_weight_down", "input_mix_weight_up", "block_inject_weight"):
         projection = getattr(module, name, None)
         if projection is not None:
             # Checkpoint-like statistics: positive scales, small biases. Random-sign scales drive the
             # up-projection gate into saturation where any rounding difference flips whole elements.
-            projection.scales = (mx.abs(mx.random.normal(projection.scales.shape)) * 0.01 + 0.002).astype(mx.bfloat16)
-            projection.biases = (mx.random.normal(projection.biases.shape) * 0.005).astype(mx.bfloat16)
+            projection.scales = (
+                mx.abs(mx.random.normal(projection.scales.shape)) * 0.01 + 0.002
+            ).astype(mx.bfloat16)
+            projection.biases = (
+                mx.random.normal(projection.biases.shape) * 0.005
+            ).astype(mx.bfloat16)
     mx.eval(module.parameters())
     return module
 
 
 def _reference_fp32(module, x):
     def dequant(q):
-        return mx.dequantize(q.weight, q.scales, q.biases, group_size=q.group_size, bits=q.bits).astype(mx.float32)
+        return mx.dequantize(
+            q.weight, q.scales, q.biases, group_size=q.group_size, bits=q.bits
+        ).astype(mx.float32)
 
     normed = module.hc_norm(x).astype(mx.float32)
     mix = nn.silu((normed @ dequant(module.input_mix_weight_down).T) / HC)
     gate = mx.sigmoid(mix @ dequant(module.input_mix_weight_up).T)
     hidden = module.hidden_size
-    mixed = mx.mean(gate.reshape(*gate.shape[:-1], HC, hidden) * normed.reshape(*normed.shape[:-1], HC, hidden), axis=-2)
+    mixed = mx.mean(
+        gate.reshape(*gate.shape[:-1], HC, hidden)
+        * normed.reshape(*normed.shape[:-1], HC, hidden),
+        axis=-2,
+    )
     if "block_inject_weight" not in module:
         return mixed, None
     return mixed, 2 * mx.sigmoid((normed @ dequant(module.block_inject_weight).T) / HC)
@@ -135,14 +152,18 @@ def test_fused_norm_is_bit_identical_to_rms_norm(hidden):
     width = HC * hidden
     x = (mx.random.normal((1, 4, width)) * 3).astype(mx.bfloat16)
     flat = x.reshape(4, width)
-    normed = hc_fused._kernel("omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], hc_fused._N_SOURCE)(
+    normed = hc_fused._kernel(
+        "omlx_qwen4_hc_fused_norm", ["x", "w", "eps"], ["xn"], hc_fused._N_SOURCE
+    )(
         inputs=[flat, module.hc_norm.weight, hc_fused._eps_array(module)],
         template=[("T", mx.bfloat16), ("K", width), ("H", hidden)],
         grid=(256, HC, 4),
         threadgroup=(256, 1, 1),
         output_shapes=[(4, width)],
         output_dtypes=[mx.bfloat16],
-    )[0]
+    )[
+        0
+    ]
     expected = module.hc_norm(x).reshape(4, width)
     mx.eval(normed, expected)
     assert mx.array_equal(normed.view(mx.uint16), expected.view(mx.uint16)).item()
@@ -156,7 +177,9 @@ def test_gated_residual_call_routes_through_fused_path(monkeypatch):
     x = mx.random.normal((1, 2, WIDTH)).astype(mx.bfloat16)
     calls = []
     original = hc_fused.fused_forward
-    monkeypatch.setattr(hc_fused, "fused_forward", lambda m, h: calls.append(h.shape) or original(m, h))
+    monkeypatch.setattr(
+        hc_fused, "fused_forward", lambda m, h: calls.append(h.shape) or original(m, h)
+    )
     out = module(x)
     mx.eval(out)
     assert calls == [(1, 2, WIDTH)]
@@ -183,26 +206,35 @@ def test_ineligible_model_is_logged_once(monkeypatch, caplog):
         assert not hc_fused.compatible(module, x)
         # Prefill-sized inputs are expected to skip the fused path and must not log.
         monkeypatch.setattr(hc_fused, "_INELIGIBLE_LOGGED", False)
-        assert not hc_fused.compatible(_module(4), mx.random.normal((1, 64, WIDTH)).astype(mx.bfloat16))
-    messages = [r.getMessage() for r in caplog.records if "fused hyper-connection kernels not used" in r.getMessage()]
+        assert not hc_fused.compatible(
+            _module(4), mx.random.normal((1, 64, WIDTH)).astype(mx.bfloat16)
+        )
+    messages = [
+        r.getMessage()
+        for r in caplog.records
+        if "fused hyper-connection kernels not used" in r.getMessage()
+    ]
     assert len(messages) == 1
     assert "hidden_size=800" in messages[0]
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_fused_path_takes_precedence_over_exact_hybrid_projection(monkeypatch):
-    # With MTP off, load_weights flags modules with upstream's exact hybrid projection and compiles
-    # their single-token _forward. The fused path must still win for decode rows (+12..14% serial).
+    # Fused dispatch takes precedence over the compiled hybrid decode path.
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     module = _module(4)
     module._omlx_exact_hybrid_projection = True
-    module._compiled_forward = lambda h: pytest.fail("compiled single-token path must not run")
+    module._compiled_forward = lambda h: pytest.fail(
+        "compiled single-token path must not run"
+    )
     x = mx.random.normal((1, 1, WIDTH)).astype(mx.bfloat16)
     assert hc_fused.compatible(module, x)
     calls = []
     original = hc_fused.fused_forward
-    monkeypatch.setattr(hc_fused, "fused_forward", lambda m, h: calls.append(h.shape) or original(m, h))
+    monkeypatch.setattr(
+        hc_fused, "fused_forward", lambda m, h: calls.append(h.shape) or original(m, h)
+    )
     out = module(x)
     mx.eval(out)
     assert calls == [(1, 1, WIDTH)]
@@ -215,10 +247,18 @@ def test_compatible_fails_closed():
     ok = mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
     if mx.metal.is_available():
         assert hc_fused.compatible(module, ok)
-    assert not hc_fused.compatible(module, mx.random.normal((1, 17, WIDTH)).astype(mx.bfloat16))
-    assert not hc_fused.compatible(module, mx.random.normal((2, 9, WIDTH)).astype(mx.bfloat16))
-    assert not hc_fused.compatible(module, mx.random.normal((1, 4, WIDTH)).astype(mx.float16))
-    assert not hc_fused.compatible(module, mx.random.normal((4, WIDTH)).astype(mx.bfloat16))
+    assert not hc_fused.compatible(
+        module, mx.random.normal((1, 17, WIDTH)).astype(mx.bfloat16)
+    )
+    assert not hc_fused.compatible(
+        module, mx.random.normal((2, 9, WIDTH)).astype(mx.bfloat16)
+    )
+    assert not hc_fused.compatible(
+        module, mx.random.normal((1, 4, WIDTH)).astype(mx.float16)
+    )
+    assert not hc_fused.compatible(
+        module, mx.random.normal((4, WIDTH)).astype(mx.bfloat16)
+    )
     module.input_inject_weight = nn.Linear(WIDTH, LOWRANK + HC, bias=False)
     assert not hc_fused.compatible(module, ok)
     del module.input_inject_weight
@@ -233,21 +273,12 @@ def test_kill_switch_disables_fused_path(monkeypatch):
     reloaded = importlib.reload(hc_fused)
     try:
         assert not reloaded.enabled()
-        assert not reloaded.compatible(_module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16))
+        assert not reloaded.compatible(
+            _module(4), mx.random.normal((1, 4, WIDTH)).astype(mx.bfloat16)
+        )
     finally:
         monkeypatch.delenv("OMLX_QWEN4_HC_FUSED")
         importlib.reload(hc_fused)
-
-
-@pytest.mark.parametrize("name", ["weight", "scales", "biases"])
-def test_malformed_projection_shape_is_rejected(name):
-    from mlx_vlm.models.qwen4_exp import hc_fused
-
-    module = _module(4)
-    q = module.input_mix_weight_down
-    q[name] = q[name][:1]
-    x = mx.zeros((1, 1, WIDTH), mx.bfloat16)
-    assert not hc_fused.compatible(module, x)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -269,3 +300,75 @@ def test_fused_mixed_injection_bits_with_lazy_strided_batch(bits):
     assert actual[0].shape == (2, 4, HIDDEN)
     assert _ulps(actual[0], expected[0])[0] <= 16
     assert _ulps(actual[2], expected[2])[0] <= 4
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("source_name", ["_N_SOURCE", "_D_SOURCE", "_U_SOURCE"])
+@pytest.mark.parametrize("use_combine", [False, True])
+def test_lazy_compilation_failure_returns_canonical_output(
+    monkeypatch, caplog, source_name, use_combine
+):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    monkeypatch.setattr(hc_fused, "_KERNELS", {})
+    monkeypatch.setattr(hc_fused, "_VALIDATED", set())
+    monkeypatch.setattr(hc_fused, "_RUNTIME_FAILED", False)
+    monkeypatch.setattr(hc_fused, "_FAILURE_LOGGED", False)
+    monkeypatch.setattr(
+        hc_fused,
+        source_name,
+        getattr(hc_fused, source_name) + "\nintentional_compile_error;\n",
+    )
+    module = _module(4, use_combine, hidden=64)
+    x = mx.ones((1, 1, HC * 64), dtype=mx.bfloat16)
+    expected = module._forward(x)
+    mx.eval(expected)
+    with caplog.at_level("WARNING", logger=hc_fused.logger.name):
+        actual = module(x)
+        mx.eval(actual)
+        repeated = module(x)
+        mx.eval(repeated)
+    assert hc_fused._RUNTIME_FAILED
+    assert not hc_fused._VALIDATED
+    assert not hc_fused.enabled()
+    if not use_combine:
+        actual, expected, repeated = [actual], [expected], [repeated]
+    for value, reference, again in zip(actual, expected, repeated):
+        assert mx.array_equal(value, reference).item()
+        assert mx.array_equal(again, reference).item()
+    messages = [r for r in caplog.records if "failed closed" in r.getMessage()]
+    assert len(messages) == 1
+    assert "intentional_compile_error" in messages[0].getMessage()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    monkeypatch.setattr(hc_fused, "_VALIDATED", set())
+    # Cover each varying template input, including mixed projection bit widths.
+    for hidden, rows, down_bits, up_bits, inject_bits in [
+        (64, 1, 4, 4, 4),
+        (64, 4, 4, 4, 4),
+        (128, 4, 4, 4, 4),
+        (128, 4, 5, 4, 4),
+        (128, 4, 5, 6, 4),
+        (128, 4, 5, 6, 8),
+        (128, 4, 5, 6, None),
+    ]:
+        module = _module(down_bits, inject_bits is not None, hidden=hidden)
+        module.input_mix_weight_up = _module(up_bits, hidden=hidden).input_mix_weight_up
+        if inject_bits is not None:
+            module.block_inject_weight = _module(
+                inject_bits, hidden=hidden
+            ).block_inject_weight
+        hc_fused._eps_array(module)
+        x = mx.ones((1, rows, HC * hidden), dtype=mx.bfloat16)
+        mx.eval(x)
+        with monkeypatch.context() as patch:
+            evaluate = Mock(wraps=mx.eval)
+            patch.setattr(mx, "eval", evaluate)
+            first = module(x)
+            second = module(x)
+            assert evaluate.call_count == 1
+        mx.eval(first, second)
+    assert len(hc_fused._VALIDATED) == 7

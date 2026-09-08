@@ -29,11 +29,6 @@ BF16_ULP = 2.0**-7
 FP32_ULP = 2.0**-23
 
 
-@pytest.fixture(autouse=True)
-def _enable_fast_norm(monkeypatch):
-    monkeypatch.setattr(language, "_FAST_RMS_NORM", True)
-
-
 def _reference(x: mx.array, weight: mx.array, eps: float, group_size: int | None):
     """The pre-fast-path body, kept verbatim as the thing we must not change."""
     dtype = x.dtype
@@ -198,17 +193,6 @@ def test_grouping_is_per_group_not_whole_vector():
 def test_rejects_a_dim_not_divisible_by_group_size():
     with pytest.raises(ValueError, match="divisible"):
         language.Qwen4ExpRMSNorm(10240, group_size=3000)
-
-
-@pytest.mark.parametrize("group_size", [None, 2560])
-def test_disabled_norm_is_exact_original_body(monkeypatch, group_size):
-    monkeypatch.setattr(language, "_FAST_RMS_NORM", False)
-    mx.random.seed(47)
-    x = mx.random.normal((1, 4, 10240)).astype(mx.bfloat16)
-    w = (mx.random.normal((10240,)) * 0.02).astype(mx.bfloat16)
-    actual = _module(10240, group_size, w)(x)
-    expected = _reference(x, w, 1e-6, group_size)
-    assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
 
 
 def test_weight_stays_a_parameter_and_nothing_else_is_registered():

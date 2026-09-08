@@ -653,6 +653,115 @@ def test_qwen4_gathered_qsa_prefill_matches_official_mask_path(monkeypatch):
     ).item()
 
 
+def test_qwen4_rank_two_text_positions_match_identical_mrope_plane_logits(
+    monkeypatch,
+):
+    """Canonical text positions preserve exact values and unlock gathered QSA."""
+    config = _tiny_config()
+    import mlx_vlm.models.qwen4_exp.language as language
+    from mlx_vlm.models.qwen4_exp.language import QSAKVCache, Qwen4ExpAttention
+
+    mx.random.seed(831)
+    attention = Qwen4ExpAttention(config.text_config)
+    projection = mx.random.normal((config.text_config.hidden_size, 17))
+    hidden = mx.random.normal((1, 20, config.text_config.hidden_size))
+    text_positions = mx.arange(20, dtype=mx.int32)[None]
+    identical_mrope = mx.broadcast_to(text_positions[None], (3, 1, 20))
+    mx.eval(attention.parameters(), projection, hidden)
+
+    assert attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        text_positions,
+        None,
+        False,
+    )
+    assert attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        identical_mrope,
+        None,
+        False,
+    )
+    unequal_mrope = mx.concatenate(
+        [text_positions[None], text_positions[None], text_positions[None] + 1],
+        axis=0,
+    )
+    assert not attention._gathered_text_prefill_eligible(
+        hidden,
+        "causal",
+        QSAKVCache(),
+        unequal_mrope,
+        None,
+        False,
+    )
+
+    gathered_calls = []
+    original_gathered = language.contiguous_causal_gathered_qsa
+
+    def tracked_gathered(*args, **kwargs):
+        gathered_calls.append(True)
+        return original_gathered(*args, **kwargs)
+
+    monkeypatch.setattr(
+        language,
+        "contiguous_causal_gathered_qsa",
+        tracked_gathered,
+    )
+    fast_cache = QSAKVCache()
+    reference_cache = QSAKVCache()
+    actual = attention(
+        hidden,
+        mask="causal",
+        cache=fast_cache,
+        position_ids=text_positions,
+    )
+    expected = attention(
+        hidden,
+        mask="causal",
+        cache=reference_cache,
+        position_ids=identical_mrope,
+    )
+    actual_logits = actual @ projection
+    expected_logits = expected @ projection
+    mx.eval(actual_logits, expected_logits)
+
+    # Both the 2-D and the broadcast 3-D text positions take the gathered arm.
+    assert gathered_calls == [True, True]
+    assert mx.allclose(actual, expected, rtol=2e-5, atol=2e-5).item()
+    assert mx.allclose(
+        actual_logits,
+        expected_logits,
+        rtol=2e-5,
+        atol=2e-5,
+    ).item()
+    assert mx.array_equal(
+        mx.argmax(actual_logits, axis=-1),
+        mx.argmax(expected_logits, axis=-1),
+    ).item()
+    assert fast_cache.offset == reference_cache.offset == 20
+    fast_keys, fast_values, fast_index_keys, _ = fast_cache.state
+    reference_keys, reference_values, reference_index_keys, _ = reference_cache.state
+    for fast_value, reference_value in (
+        (fast_keys, reference_keys),
+        (fast_values, reference_values),
+    ):
+        assert mx.allclose(
+            fast_value,
+            reference_value,
+            rtol=2e-5,
+            atol=2e-5,
+        ).item()
+    assert mx.allclose(
+        fast_index_keys,
+        reference_index_keys,
+        rtol=2e-5,
+        atol=2e-5,
+    ).item()
+
+
 def test_qwen4_gathered_qsa_fails_closed_for_multimodal_positions(monkeypatch):
     config = _tiny_config()
     import mlx_vlm.models.qwen4_exp.language as language
@@ -1180,6 +1289,142 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path):
     assert embedding.last_touched_shards == (0, 1)
     assert embedding.rows_read == 2
     embedding.close()
+
+
+@pytest.fixture
+def disk_ple_reader(tmp_path):
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as ple
+
+    # 166-byte rows exercise reads that straddle page boundaries.
+    dense = (mx.arange(4096 * 83).reshape(4096, 83) / 3.0).astype(mx.bfloat16)
+    path = tmp_path / "ple.safetensors"
+    mx.save_safetensors(str(path), {"weight": dense})
+    reader = ple._SafeTensorMMap(path)
+    try:
+        yield ple, reader, dense
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("short_reads", [False, True])
+def test_disk_backed_ple_page_prefetch_returns_identical_rows(
+    disk_ple_reader, monkeypatch, short_reads
+):
+    """Read every required page once, retry short reads, and skip warm prefetch."""
+    ple, reader, dense = disk_ple_reader
+    page_size = ple._PLE_PAGE_SIZE
+    row_bytes = 83 * 2
+    base = reader._data_start + reader._header["weight"]["data_offsets"][0]
+    crossing = next(
+        row
+        for row in range(4096)
+        if (base + row * row_bytes) % page_size + row_bytes > page_size
+    )
+    indices = [crossing, crossing, 0, 1, 1000, 2000, 3000, 4000, 4095]
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    # Enumerate the byte spans independently of the prefetch endpoint formula.
+    needed_pages = {
+        offset // page_size
+        for row in indices
+        for offset in range(base + row * row_bytes, base + (row + 1) * row_bytes)
+    }
+    reads = []
+    original_pread = ple.os.pread
+
+    def record_pread(fd, size, offset):
+        limit = min(size, page_size // 3) if short_reads else size
+        data = original_pread(fd, limit, offset)
+        reads.append((offset, len(data)))
+        return data
+
+    monkeypatch.setattr(ple.os, "pread", record_pread)
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert {offset // page_size for offset, _ in reads} == needed_pages
+    file_size = reader.path.stat().st_size
+    for page in needed_pages:
+        spans = sorted(
+            (offset, length)
+            for offset, length in reads
+            if offset // page_size == page and length
+        )
+        cursor = page * page_size
+        for offset, length in spans:
+            assert offset == cursor
+            cursor += length
+        assert cursor == min((page + 1) * page_size, file_size)
+    assert all(reader._seen_pages[page] for page in needed_pages)
+
+    # Fix the measured time so a busy test host cannot trigger reactivation.
+    monkeypatch.setattr(ple, "time", SimpleNamespace(perf_counter=lambda: 0.0))
+    reads.clear()
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    assert reads == []
+
+
+@pytest.mark.parametrize("row_count", [0, 1, 8])
+def test_disk_backed_ple_small_gathers_skip_prefetch(
+    disk_ple_reader, monkeypatch, row_count
+):
+    _, reader, dense = disk_ple_reader
+    prefetch = MagicMock(side_effect=AssertionError("Unexpected prefetch"))
+    monkeypatch.setattr(reader, "_prefetch_missing_pages", prefetch)
+    indices = list(range(row_count))
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    assert mx.array_equal(reader.rows("weight", indices), expected).item()
+    prefetch.assert_not_called()
+
+
+def test_disk_backed_ple_rearms_seen_bitmap_on_slow_gather(
+    disk_ple_reader, monkeypatch, caplog
+):
+    """Control both clocks to verify the budget, retry, and interval boundary."""
+    ple, reader, dense = disk_ple_reader
+    indices = list(range(16))
+    expected = dense[mx.array(indices, dtype=mx.int32)]
+    pread = MagicMock(wraps=ple.os.pread)
+    monkeypatch.setattr(ple.os, "pread", pread)
+    budget = (
+        ple._PLE_REARM_FLOOR_SECONDS + len(indices) * ple._PLE_REARM_PER_ROW_SECONDS
+    )
+    interval = ple._PLE_REARM_MIN_INTERVAL_SECONDS
+    caplog.set_level("INFO", logger=ple.__name__)
+
+    def gather(elapsed, now):
+        ticks = iter((0.0, elapsed))
+        monkeypatch.setattr(
+            ple,
+            "time",
+            SimpleNamespace(perf_counter=lambda: next(ticks), monotonic=lambda: now),
+        )
+        values = reader.rows("weight", indices)
+        assert mx.array_equal(values, expected).item()
+
+    gather(0.0, 1000.0)
+    assert pread.call_count > 0
+    pread.reset_mock()
+    gather(budget / 2, 1000.0)
+    assert reader._rearm_count == 0
+    assert any(reader._seen_pages)
+    pread.assert_not_called()
+
+    gather(budget * 2, 1000.0)
+    assert reader._rearm_count == 1
+    assert not any(reader._seen_pages)
+    assert "re-armed seen-page bitmap" in caplog.text
+    pread.assert_not_called()
+
+    gather(0.0, 1001.0)
+    assert pread.call_count > 0
+    assert any(reader._seen_pages)
+    pread.reset_mock()
+    gather(budget * 2, 1000.0 + interval - 1.0)
+    assert reader._rearm_count == 1
+    assert any(reader._seen_pages)
+    gather(budget * 2, 1000.0 + interval)
+    assert reader._rearm_count == 2
+    assert not any(reader._seen_pages)
+    pread.assert_not_called()
 
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])

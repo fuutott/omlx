@@ -67,6 +67,40 @@ class TestBoundarySnapshotLifecycle:
         assert stale_dir.exists()
 
 
+@pytest.mark.asyncio
+async def test_text_completion_stream_forwards_transport_request_id():
+    from omlx.api.openai_models import CompletionRequest
+    from omlx.server import stream_completion
+
+    class Engine:
+        tokenizer = None
+
+        def __init__(self):
+            self.kwargs = None
+
+        async def stream_generate(self, **kwargs):
+            self.kwargs = kwargs
+            if False:
+                yield None
+
+    engine = Engine()
+    request = CompletionRequest(model="model", prompt="hello", stream=True)
+
+    chunks = [
+        chunk
+        async for chunk in stream_completion(
+            engine,
+            "hello",
+            request,
+            prompt_token_ids=[],
+            inference_request_id="transport-completion-1",
+        )
+    ]
+
+    assert chunks == ["data: [DONE]\n\n"]
+    assert engine.kwargs["_request_id"] == "transport-completion-1"
+
+
 class TestDiffusionStructuredOutputGuard:
     class _DiffusionEngine:
         is_diffusion_model = True
