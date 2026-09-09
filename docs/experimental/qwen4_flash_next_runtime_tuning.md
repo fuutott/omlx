@@ -1,5 +1,11 @@
 # Qwen4 T5 runtime tuning — 2026-09-07
 
+> **Historical document.** Written on 2026-09-07 against the weight-only
+> checkpoint and kept for the record. Some switches it describes as default-off
+> are now upstream defaults, and the released checkpoint uses a different recipe.
+> The current runtime defaults, recipe and measured results are in the README and
+> on the released checkpoint's model card.
+
 We are optimizing the runtime for the existing weight-only prefix-fit T5/Q8-PLE
 checkpoint on a 48 GB M3 Max. Freeze the weights, tokenizer, template, expert
 routing and quantization recipe. Imatrix and additional precision changes are

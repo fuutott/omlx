@@ -110,7 +110,8 @@ not a GGUF or one self-contained file.
 | Token embeddings and LM head | Affine Q6, group 64 |
 | Attention/DeltaNet projections | Affine Q5, group 64; QSA `o_proj` remains Q4/group 64 |
 | Other eligible matrices | Affine Q4, group 64 |
-| Vision, MoE routers, norms, convolutions and recurrent parameters | Retain source precision (BF16 in the pinned source) |
+| Vision tower Linear layers | Affine Q8, group 64 (`--vision-bits 8`; `--vision-bits 0` keeps them BF16) |
+| MoE routers, norms, convolutions, recurrent parameters and the rest of the vision tower | Retain source precision (BF16 in the pinned source) |
 | MTP | Omitted from the baseline; optional separate Q8 addition below |
 
 The Q3-down output is approximately **90 GiB on disk**, including approximately
@@ -148,6 +149,10 @@ uv tool install huggingface_hub
 # If authentication is needed: hf auth login (never put tokens in this README).
 hf download Qwen/Qwen3.8-Flash-Next --revision $qwenRevision --cache-dir $env:HF_HUB_CACHE
 hf cache verify Qwen/Qwen3.8-Flash-Next --revision $qwenRevision --cache-dir $env:HF_HUB_CACHE --fail-on-missing-files
+
+# Unsloth's importance matrix for this model; both recipes below use it.
+hf download unsloth/Qwen3.8-Flash-Next-GGUF imatrix_unsloth.gguf_file --cache-dir $env:HF_HUB_CACHE
+$imatrix = Get-ChildItem (Join-Path $env:HF_HUB_CACHE 'models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots') -Recurse -Filter imatrix_unsloth.gguf_file | Select-Object -First 1 -ExpandProperty FullName
 ```
 
 Stop on any command failure. On Windows, enabling Developer Mode permits HF
@@ -169,7 +174,7 @@ uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_q
 Use a fresh output directory. After an interruption, rerun the **same conversion
 command** with `--resume`; the manifest must match source, converter, recipe and
 environment. A changed recipe/code/chunk size needs a new directory. `$imatrix` is
-the Unsloth file downloaded in step 2b; omit the imatrix flags to reproduce the
+the Unsloth file downloaded in step 1; omit the imatrix flags to reproduce the
 historical weight-only bake, and omit `--expert-down-bits 3` for the 30.9 GiB
 Q2-down variant. `--t5-fitter legacy` and `--ple-bits 2` are historical
 controls only.
@@ -201,8 +206,7 @@ vision tower cannot be dropped entirely because the runtime always builds it and
 loads weights strictly.
 
 ```powershell
-hf download unsloth/Qwen3.8-Flash-Next-GGUF imatrix_unsloth.gguf_file --cache-dir $env:HF_HUB_CACHE
-$imatrix = Get-ChildItem (Join-Path $env:HF_HUB_CACHE 'models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots') -Recurse -Filter imatrix_unsloth.gguf_file | Select-Object -First 1 -ExpandProperty FullName
+# $qwenSource and $imatrix come from step 1.
 $qwenAffineOutput = Join-Path $env:HF_HOME 'artifacts\qwen4-affine-q2-imatrix-ple8'
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenAffineOutput --expert-format affine --imatrix $imatrix --imatrix-strict --vision-bits 8 --device cuda:0 --chunk-rows 4096
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --verify-only $qwenAffineOutput

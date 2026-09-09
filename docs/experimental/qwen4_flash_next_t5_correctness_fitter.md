@@ -1,5 +1,11 @@
 # T5 lazy-layout fix and weight-only fitter — 2026-09-06
 
+> **Historical document.** Written on 2026-09-06 and kept for the record. The
+> imatrix it describes as parked was later fixed (DeltaNet `out_proj`
+> un-permute) and is used by the released checkpoint; the prefix fitter it
+> introduces is still the default. Current recipe, status and measured results
+> are in the README and on the released checkpoint's model card.
+
 We are doing quantization optimizations to fit Qwen3.8-Flash-Next (`qwen4_exp`)
 on a 48 GB M3 Max, keeping PLE ngrams on SSD. The first **weight-only T5** was
 reasonably coherent according to the user, with some factual errors. The later

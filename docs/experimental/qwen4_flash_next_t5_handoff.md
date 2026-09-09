@@ -1,5 +1,13 @@
 # Qwen3.8-Flash-Next T5 handoff
 
+> **Historical document.** This handoff records the state of the work between
+> 2026-09-06 and 2026-09-08 and is kept for the record. The recipe it calls
+> current (Q2 down, imatrix parked, no KL divergence measured) has been
+> superseded: the released checkpoint uses imatrix-weighted ternary gate/up with
+> Q3 down, and its KL divergence, benchmark and Mac memory/speed results are
+> measured. The current recipe, status and numbers are in the README and on the
+> released checkpoint's model card.
+
 Integration update (2026-09-08): the upstream merge incorporates
 `94530d8d49541ede9e99ef04a4431ee4953117a6` and includes the Mac fixes through
 `0820cfc96eefcea20d156b7058ea05cda5810c11`. By user decision, fused HC now
@@ -77,10 +85,11 @@ The conversion recipe is architecture-specific and lives in
 locked by `tools/qwen4_flash_next_quant.in` and
 `tools/qwen4_flash_next_quant.lock`.
 
-The current recipe is:
+The recipe at the time of this handoff (superseded; see the note at the top and
+the README's recipe table) was:
 
 - routed expert gate/up: Bonsai base-3 T5, group size 128;
-- routed expert down: affine 2-bit, group size 128;
+- routed expert down: affine 2-bit, group size 128 (the release uses 3-bit);
 - PLE n-gram embeddings: affine 8-bit by default, group size 32, retained in
   independently mmap-able shards (`--ple-bits 2` reproduces the historical control);
 - shared experts: affine 8-bit;

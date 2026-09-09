@@ -1,5 +1,10 @@
 # Qwen4 T5 + Q8 MTP candidate
 
+> **Historical document.** The Q8 MTP head described here was tested on the Mac
+> on 2026-09-08 and 2026-09-09: about 75 % draft acceptance, little end-to-end
+> gain, and several GiB of extra swap on 48 GB, so the released checkpoint ships
+> without it. The tool remains available for experiments.
+
 User decision (2026-09-08): restore the original one-layer MTP head at Q8.
 Keep the measured prefix-fit T5 target, Q8 SSD PLE, tokenizer and template
 unchanged. No imatrix, new runtime optimization or KV-cache quantization work.
