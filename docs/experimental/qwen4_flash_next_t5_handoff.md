@@ -46,12 +46,11 @@ full conversion has run. The native lazy-layout fix still requires Mac testing.
 Read [the correctness/fitter update](qwen4_flash_next_t5_correctness_fitter.md)
 for the changes, real-weight measurements and required native validation.
 
-Read [the Q8 restart and performance plan](qwen4_flash_next_q8_restart.md) for
-current changes, validation gates, and outstanding recipe improvements. The
-historical artifact sizes and generation results below describe Q2 PLE models,
-not a Q8 model. Later quality/performance improvements remain unproven.
+The Q8 PLE default, the guarded prefix fitter and the resume manifest are
+described in the correctness/fitter update above. The historical artifact sizes
+and generation results below describe Q2 PLE models, not a Q8 model.
 
-This branch explores whether Qwen3.8-Flash-Next can run on a 48 GB M3 Max by
+This fork explores whether Qwen3.8-Flash-Next can run on a 48 GB M3 Max by
 combining OMLX's SSD-mmap support for Qwen4 PLE n-grams with an AngelSlim-inspired
 sub-2-bit expert representation. The model must be treated as `qwen4_exp` (a
 Qwen4 experimental architecture), not as Qwen3.5.
@@ -60,27 +59,16 @@ Qwen4 experimental architecture), not as Qwen3.5.
 
 Published artifacts and coordination:
 
-- OMLX fork/branch: `https://github.com/fuutott/omlx/tree/qwen4-flash-next-t5`
+- OMLX fork: `https://github.com/fuutott/omlx` (branch `main`)
 - Original OMLX implementation commit: `9ae674fc931070eab1c56780abaa5ccc9187273e`
 - Agreed code-review baseline: `dc7aaee37066c139d58ad5540646644d36140f39`
-- Private Hugging Face checkpoint: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5`
+- Released checkpoint: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5-imatrix-q3down-ple8`
 - Base checkpoint revision: `de4b8e4d43b917e7706784d8bb445c9af86a3540`
-- Published checkpoint revision: `7f093be9c5efbfa04f471f025c882ab0d664b42c`
-- Historical `imatrix-v2` upload completed at `def75d34004cd7e229b059639209fc1bb24a792a`.
-  This is a historical record, not a fresh check of remote availability.
-- Canonical HF coordination thread: `https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5/discussions/1`
-- Former Windows artifact (deleted): `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5`
-- Former Windows imatrix artifact (deleted):
-  `D:\hf_models_cache\artifacts\Qwen3.8-Flash-Next-MLX-t5-imatrix`
 - Windows conversion report: `omlx_conversion.json` in the artifact
 
 The Mac needs the modified OMLX checkout and the converted MLX checkpoint. It
-does not need AngelSlim, the Windows `.model-research` directory, CUDA, PyTorch,
-or the converter environment merely to run the model.
-
-The HF thread is a user-gated mailbox. Its one-message-at-a-time read/write
-rules apply only to that discussion, not other communication. Read
-`docs/experimental/qwen4_flash_next_t5_comms.md` before accessing it.
+does not need AngelSlim, the Windows conversion environment, CUDA or PyTorch
+merely to run the model.
 
 ## What changed
 
@@ -158,9 +146,8 @@ The full strict conversion completed in 12.4 minutes on the Windows CUDA host.
 Its independent `--verify-only` pass reports 131 shards, 3,671 tensors,
 53,917,360,592 converted tensor bytes, 48 expert layers, and all 128 PLE weight
 shards. The conversion audit records 852 applied imatrix entries, zero missing
-entries, zero shape mismatches, and 24 imputed expert slots. The resulting
-checkpoint was subsequently uploaded as `imatrix-v2`. End-to-end quality and
-native numerical correctness were not established by structural verification.
+entries, zero shape mismatches, and 24 imputed expert slots. End-to-end quality
+and native numerical correctness were not established by structural verification.
 
 ## First Mac evidence
 
@@ -204,9 +191,8 @@ ample free space for `HF_HOME` and the checkpoint.
 ```bash
 export HF_HOME=/absolute/path/to/hf-cache
 
-git clone <OMLX_FORK_URL>
+git clone https://github.com/fuutott/omlx.git
 cd omlx
-git switch qwen4-flash-next-t5
 
 uv venv --python 3.12 .venv
 OMLX_WITH_CUSTOM_KERNEL=1 uv pip install -e .
@@ -218,14 +204,14 @@ Stop if the `bonsai` entry reports `available: False`. Capture the complete
 import error and verify that `xcrun -f metal` resolves into the full Xcode
 toolchain before rebuilding.
 
-Download the private checkpoint without putting it in the Git checkout:
+Download the checkpoint without putting it in the Git checkout:
 
 ```bash
-hf auth whoami
-hf download <HF_CHECKPOINT_REPO> --local-dir /absolute/path/to/checkpoints/Qwen3.8-Flash-Next-MLX-t5
+hf download fuutott/Qwen3.8-Flash-Next-MLX-t5-imatrix-q3down-ple8 \
+  --local-dir /absolute/path/to/checkpoints/Qwen3.8-Flash-Next-MLX-t5-imatrix-q3down-ple8
 
 uv run python tools/quantize_qwen4_flash_next_t5.py \
-  --verify-only /absolute/path/to/checkpoints/Qwen3.8-Flash-Next-MLX-t5
+  --verify-only /absolute/path/to/checkpoints/Qwen3.8-Flash-Next-MLX-t5-imatrix-q3down-ple8
 ```
 
 Keep `HF_HOME` exported for OMLX as well. Do not copy the model into the fork or

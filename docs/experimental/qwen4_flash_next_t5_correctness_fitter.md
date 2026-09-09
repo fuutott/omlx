@@ -93,9 +93,8 @@ better generation**. No full new checkpoint has been converted or evaluated.
 Single-pass timing in the JSON includes warmup effects and is not a reliable
 full-conversion ETA.
 
-The local raw report is
-`C:\dev\next48\.model-research\qwen4-t5-prefix-real-weights-20260906.json`.
-It records the exact converter/benchmark hashes and source index identity.
+The raw report (`qwen4-t5-prefix-real-weights-20260906.json`, kept outside the
+repository) records the exact converter/benchmark hashes and source index identity.
 Windows validation: **18 portable tests passed**, including the CUDA
 legacy-identity/guard test; both CUDA self-tests passed (prefix RMSE 0.438874,
 legacy 0.439448 on the same synthetic fixture). Five changed Python files
@@ -105,13 +104,11 @@ execution requires the Mac regardless. No native test pass is claimed here.
 Reproduce without writing any checkpoint weights:
 
 ```powershell
-$env:HF_HOME='D:\hf_models_cache'
+$env:HF_HOME='D:\hf-cache'  # your SSD-backed HF_HOME
 uv --cache-dir ..\.uv-cache run --no-project --offline --python .venv\Scripts\python.exe python -B -m unittest discover -s tools/tests -v
 uv --cache-dir ..\.uv-cache run --no-project --offline --python .venv\Scripts\python.exe python -B tools/quantize_qwen4_flash_next_t5.py --self-test --device cuda:0
-uv --cache-dir ..\.uv-cache run --no-project --offline --python .venv\Scripts\python.exe python -B -m tools.qwen4_t5_fit_bench --model D:\hf_models_cache\hub\models--Qwen--Qwen3.8-Flash-Next\snapshots\de4b8e4d43b917e7706784d8bb445c9af86a3540 --output ..\.model-research\NEW-fit-report.json
+uv --cache-dir ..\.uv-cache run --no-project --offline --python .venv\Scripts\python.exe python -B -m tools.qwen4_t5_fit_bench --model $env:HF_HOME\hub\models--Qwen--Qwen3.8-Flash-Next\snapshots\de4b8e4d43b917e7706784d8bb445c9af86a3540 --output ..\fit-report.json
 ```
 
 The model download worker reported successful completion at 18:04:43 UTC on
 2026-09-06. This is download completion, not an independent full SHA verification.
-Nothing in this document authorizes a mailbox fetch/reply, model upload, or a
-full bake; the existing per-operation user-gated HF mailbox rules still apply.

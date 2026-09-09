@@ -163,12 +163,3 @@ Twenty questions are a regression smoke, not statistical proof of unchanged
 quality. Exact answer text need not survive BF16 fusion rounding; inspect
 numerical parity, answer flips and truncations together. Do not run another
 700-case evaluation during optimization unless the user requests it.
-
-## Coordination
-
-No mailbox read/post is authorized by this document. The original user-gated
-HF discussion protocol remains in force. The user authorized this candidate's
-commit/push and one handoff message; this is not standing permission to fetch
-or post results. Do not start/reconfigure its server from Windows during
-preparation. Mac-side isolated test restarts are part of the requested matrix;
-preserve its mainline installation and any unrelated work.

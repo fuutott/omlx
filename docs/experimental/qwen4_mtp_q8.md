@@ -38,11 +38,12 @@ MTP stripping or overwrite any existing output directory.
 Use the existing isolated Windows CUDA environment, with explicit HF_HOME:
 
 ```powershell
-$env:HF_HOME = 'D:\hf_models_cache'
+$env:HF_HOME = 'D:\hf-cache'  # your SSD-backed HF_HOME
+$qwenSource = Join-Path $env:HF_HOME 'hub\models--Qwen--Qwen3.8-Flash-Next\snapshots\de4b8e4d43b917e7706784d8bb445c9af86a3540'
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/add_qwen4_mtp_q8.py `
-  --source D:/hf_models_cache/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540 `
-  --base D:/hf_models_cache/artifacts/Qwen3.8-Flash-Next-MLX-t5-prefix-ple8-0a21f3d8 `
-  --output D:/hf_models_cache/artifacts/Qwen3.8-Flash-Next-MLX-t5-prefix-ple8-mtp8
+  --source $qwenSource `
+  --base (Join-Path $env:HF_HOME 'artifacts\qwen4-t5-prefix-ple8') `
+  --output (Join-Path $env:HF_HOME 'artifacts\qwen4-t5-prefix-ple8-mtp8')
 ```
 
 The same script's `--verify-only --base BASE --output CANDIDATE` checks the

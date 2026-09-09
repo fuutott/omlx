@@ -1,7 +1,7 @@
-# Qwen3.8-Flash-Next experimental branch
+# Qwen3.8-Flash-Next experimental fork
 
 Read `docs/experimental/qwen4_flash_next_t5_handoff.md` before changing or
-testing the Qwen3.8-Flash-Next work on this branch.
+testing the Qwen3.8-Flash-Next work in this fork.
 
 This model is `qwen4_exp`, not Qwen3.5. Preserve its Qwen4 experimental
 architecture, PLE n-gram embedding layout, DeltaNet layers, hyper-connections,
@@ -28,12 +28,11 @@ commands against the actual parsers and dependency lock; update the status date
 and distinguish measured results from pending validation. Keep the entire fork
 overview and recipe above the oMLX logo, with a prominent unofficial-fork notice
 and a clear boundary before upstream branding/documentation. Preserve upstream's
-README content outside this fork-specific section. Do not add generated-model
-download links, private model repository/mailbox coordinates, credentials or
+README content outside this fork-specific section. Do not add credentials or
 machine-specific private paths to this public section. The original source
-model ID/revision in the reproduction commands is intentional. Keeping this
-documentation current does not authorize background polling, downloads or
-mailbox operations.
+model ID/revision in the reproduction commands is intentional, and so is the
+link to the released checkpoint. Keeping this documentation current does not
+authorize background polling or downloads.
 
 The below-q2 T5 expert format is experimental. Do not describe the model as
 coherent or lossless until a real M3 Max run has completed. Record the exact
@@ -44,11 +43,3 @@ For runtime changes, run the focused Bonsai and Qwen gate/up tests as well as
 syntax/static checks. Windows can validate conversion and checkpoint structure,
 but native Metal compilation and numerical runtime tests must be performed on
 Apple Silicon.
-
-The HF discussion mailbox at
-`fuutott/Qwen3.8-Flash-Next-MLX-t5/discussions/1` has a strict, user-gated
-protocol documented in
-`docs/experimental/qwen4_flash_next_t5_comms.md`. These mailbox rules apply
-only to that HF discussion, not to normal user chat, Git/GitHub work, terminal
-actions, or other communication. Never read or write the mailbox without a
-direct instruction from the user for that single operation.
