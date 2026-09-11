@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import omlx.server as srv
 from omlx.engine_pool import EngineEntry
 from omlx.exceptions import (
     InvalidRequestError,
@@ -516,6 +519,47 @@ class TestExceptionHandlers:
         assert response.status_code == 404
         data = response.json()
         assert "detail" in data
+
+    def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
+        """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
+
+        Pydantic v2 stashes the raw exception in ``ctx``, which ``JSONResponse``
+        cannot serialize, so the admin handler used to die building the body
+        ("Object of type ValueError is not JSON serializable") and the client
+        saw a 500 with no detail.
+        """
+        import json
+
+        from fastapi.exceptions import RequestValidationError
+        from pydantic import BaseModel, ValidationError, field_validator
+
+        from omlx.server import validation_exception_handler
+
+        class _ExternalApiLike(BaseModel):
+            base_url: str
+
+            @field_validator("base_url")
+            @classmethod
+            def _validate_base_url(cls, v: str) -> str:
+                if not v.startswith(("http://", "https://")):
+                    raise ValueError("base_url must start with http:// or https://")
+                return v
+
+        with pytest.raises(ValidationError) as exc_info:
+            _ExternalApiLike(base_url="ftp://x")
+        errors = exc_info.value.errors()
+        assert isinstance(errors[0].get("ctx", {}).get("error"), ValueError)
+
+        request = SimpleNamespace(
+            method="PUT",
+            url=SimpleNamespace(path="/admin/api/models/x/settings"),
+        )
+        response = asyncio.run(
+            validation_exception_handler(request, RequestValidationError(errors))
+        )
+        assert response.status_code == 422
+        body = json.loads(response.body.decode())
+        assert body["detail"][0]["loc"][-1] == "base_url"
 
 
 class TestModelFallback:
@@ -1037,3 +1081,59 @@ class TestHealthPreloadReadiness:
             assert body["status"] == "healthy"
         finally:
             server_mod._server_state.pinned_preload_complete = old
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "model_type, template_default, kwargs, forced, expected",
+    [
+        ("qwen3_5", True, {}, None, True),
+        ("qwen3_5", True, {"preserve_thinking": False}, None, False),
+        ("qwen3_5", True, {"preserve_thinking": False}, True, True),
+        ("minimax_m3", None, {}, None, True),
+        ("minimax_m3", None, {}, False, False),
+        ("llama", None, {}, None, False),
+    ],
+)
+def test_responses_reasoning_cache_policy(
+    monkeypatch, stream, model_type, template_default, kwargs, forced, expected
+):
+    """Exercise cache policy through the real route before generation starts."""
+    engine = MagicMock()
+    engine.model_type = model_type
+    engine.is_diffusion_model = False
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Policy captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type=model_type,
+        preserve_thinking_default=template_default,
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(
+        srv,
+        "get_model_settings_for_request",
+        lambda name: ModelSettings(cache_reasoning_output=forced),
+    )
+    monkeypatch.setitem(srv.app.dependency_overrides, srv.verify_api_key, lambda: True)
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "stream": stream,
+                "chat_template_kwargs": kwargs,
+            },
+        )
+    assert response.status_code == 418, response.text
+    assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected

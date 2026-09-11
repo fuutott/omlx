@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,11 @@ def preflight_text_remote_code(
 
 
 def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
-    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    """Forward the configured trust setting to the model and tokenizer loaders."""
+    kwargs["tokenizer_config"] = {
+        **(kwargs.get("tokenizer_config") or {}),
+        "trust_remote_code": trust_remote_code,
+    }
     preflight_text_remote_code(
         path_or_repo,
         tokenizer_config=kwargs.get("tokenizer_config"),
@@ -427,6 +432,36 @@ def maybe_apply_pre_load_patches(
 
     Safe to call repeatedly; the patches are idempotent.
     """
+    from ..model_settings import validate_moe_expert_offload
+
+    if model_settings is not None:
+        validate_moe_expert_offload(
+            {
+                "moe_expert_offload_resident_fraction": getattr(
+                    model_settings, "moe_expert_offload_resident_fraction", 0.25
+                ),
+                **{
+                    key: getattr(model_settings, key, False)
+                    for key in (
+                        "moe_expert_offload_enabled",
+                        "mtp_enabled",
+                        "vlm_mtp_enabled",
+                        "dflash_enabled",
+                    )
+                },
+            }
+        )
+
+    if (
+        getattr(model_settings, "moe_expert_offload_enabled", False)
+        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+    ):
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        supported, reason = moe_offload_compatibility(model_name)
+        if not supported:
+            raise ValueError(reason)
+
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
@@ -517,7 +552,15 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
+    if model_type == "deepseek_v41":
+        from ..patches.deepseek_v41 import apply_patch
+
+        apply_patch()
+    if (
+        isinstance(model_type, str)
+        and model_type.startswith("deepseek_v4")
+        and not model_type.startswith("deepseek_v41")
+    ):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
         if apply_deepseek_v4_patch():
@@ -548,6 +591,12 @@ def maybe_apply_pre_load_patches(
 
         if apply_laguna_patch():
             logger.info("Laguna pre-load patch applied for %s", model_name)
+
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2 Horizon pre-load patch applied for %s", model_name)
 
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
@@ -842,7 +891,7 @@ def maybe_apply_pre_load_patches(
                             "weights to bind)",
                             model_name,
                         )
-                if apply_mlx_vlm_mtp_runtime_patch():
+                if apply_mlx_vlm_mtp_runtime_patch(model_type):
                     if not has_mtp_weights:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s "
@@ -1121,6 +1170,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "glm5_next"
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"

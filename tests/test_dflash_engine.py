@@ -2010,13 +2010,14 @@ class TestSpeculationStats:
 @pytest.mark.parametrize(
     "scenario", ["complete", "abort", "cancel_queued", "cancel_running"]
 )
-async def test_generation_abort_lifetime(monkeypatch, streaming, scenario):
+async def test_generation_abort_lifetime(monkeypatch, caplog, streaming, scenario):
     from dflash_mlx.engine.events import TokenEvent
 
     from omlx.engine.dflash import DFlashEngine
     from omlx.exceptions import PrefillMemoryAbortedError
     from omlx.process_memory_enforcer import ProcessMemoryEnforcer
 
+    monkeypatch.setattr("omlx.engine.dflash._EXECUTOR_DRAIN_TIMEOUT", 0.01)
     started = threading.Event()
     release = threading.Event()
     closed = threading.Event()
@@ -2061,10 +2062,12 @@ async def test_generation_abort_lifetime(monkeypatch, streaming, scenario):
                         await asyncio.sleep(0.01)
             if scenario.startswith("cancel"):
                 task.cancel()
-                # Exercise the real 10-second drain timeout, including its
-                # cancellation of the asyncio wrapper around executor work.
+                # Exercise the real timeout path with a short test deadline,
+                # including cancellation of the asyncio executor wrapper.
                 with pytest.raises(asyncio.CancelledError):
                     await task
+                assert "DFlash executor did not exit within" in caplog.text
+                assert not closed.is_set()
                 assert engine.has_active_requests() is (blocker is None)
             else:
                 if scenario == "abort":

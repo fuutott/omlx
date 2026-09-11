@@ -39,6 +39,9 @@ from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import (
     MAX_LIGHTNING_MTP_DRAFT_TOKENS,
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    validate_ane_prefill,
     merge_chat_template_kwargs,
 )
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
@@ -146,6 +149,21 @@ print(deleted)
     return deleted, len(node_ids)
 
 
+def _oq_a8_kernels_available() -> bool:
+    """True when the oQ A8 prefill kernels can actually run on this host.
+
+    Enabling the setting on a machine without tensor units would leave every
+    projection falling back, so the save is refused rather than accepted into
+    a no-op.
+    """
+    try:
+        from omlx.custom_kernels.qwen35_prefill import fast
+
+        return bool(fast.oq_a8_available())
+    except Exception:
+        return False
+
+
 # =============================================================================
 # Pydantic Models
 # =============================================================================
@@ -221,6 +239,7 @@ class ModelSettingsRequest(BaseModel):
     # template supports it). Mirrors ModelSettings.preserve_thinking.
     preserve_thinking: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    deepseek_v41_engram_ssd_offload: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
@@ -234,6 +253,7 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_sequence_length: int | None = None
     qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
     qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_shared_fraction: float | None = None
     qwen35_ane_prefill_fused_down: bool | None = None
     qwen35_ane_prefill_max_layers: int | None = None
     qwen35_ane_prefill_dual_ane: bool | None = None
@@ -246,6 +266,12 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8)
+    qwen35_oq_a8_enabled: bool | None = None
+    qwen35_oq_a8_min_tokens: int | None = None
+    # MoE expert offload (stream non-resident experts from the checkpoint)
+    moe_expert_offload_enabled: bool | None = None
+    moe_expert_offload_resident_fraction: float | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -383,6 +409,9 @@ class GlobalSettingsRequest(BaseModel):
     # MCP settings
     mcp_config: str | None = None
     mcp_expose_tools: bool | None = None
+
+    # Usage history settings
+    usage_history: bool | None = None
 
     # HuggingFace settings
     hf_endpoint: str | None = None
@@ -657,6 +686,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_kv_enabled"] = False
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
+    settings["moe_expert_offload_enabled"] = False
+    settings["moe_expert_offload_resident_fraction"] = 0.25
     settings["specprefill_enabled"] = False
     settings["dflash_enabled"] = False
     settings["dflash_in_memory_cache"] = True
@@ -732,6 +763,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_kv_enabled = False
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
+    settings.moe_expert_offload_enabled = False
+    settings.moe_expert_offload_resident_fraction = 0.25
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -1951,6 +1984,33 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
+def _model_options(model_info: dict, settings) -> dict:
+    """Describe model controls once for the web and native settings clients."""
+    from ..patches.k2_horizon import REASONING_EFFORTS
+
+    model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
+    is_k2 = model_type == "k2_horizon"
+    thinking_modes = ["auto", "on_limit"] if is_k2 else [
+        "auto", "on_unlimit", "on_limit", "off"
+    ]
+    ane_backend = (
+        None if model_info.get("is_helper") else ane_prefill_backend(model_type)
+    )
+    return {
+        "thinking_forced": is_k2,
+        "thinking_modes": thinking_modes,
+        "reasoning_effort_options": list(REASONING_EFFORTS) if is_k2 else [
+            "low", "medium", "high", "xhigh", "max"
+        ],
+        "reasoning_effort_default": "high" if is_k2 else "low",
+        "reasoning_effort_custom": not is_k2,
+        "ane_prefill_backend": ane_backend,
+        "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
+        "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
+        "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
+    }
+
+
 def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
     if global_settings is None:
         return []
@@ -2030,6 +2090,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        moe_offload_supported, _ = moe_offload_compatibility(
+            model_info.get("model_path") or ""
+        )
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2045,6 +2110,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 estimate = qwen4_exp_residency_estimate(
                     model_info.get("model_path", "")
                 )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._qwen4_ple_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
                 qwen4_ple_ssd_offload_supported = estimate.supported
                 qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
                     residency_ceiling
@@ -2054,6 +2127,42 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             except (OSError, TypeError, ValueError):
                 logger.debug(
                     "Could not inspect Qwen4-Exp PLE residency for %s",
+                    model_id,
+                    exc_info=True,
+                )
+
+        deepseek_v41_engram_ssd_offload_supported = False
+        deepseek_v41_engram_ssd_offload_forced = False
+        v41_resident_bytes = 0
+        v41_mmap_bytes = 0
+        if (model_info.get("config_model_type") or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41":
+            try:
+                from ..patches.deepseek_v41.residency import (
+                    deepseek_v41_residency_estimate,
+                )
+
+                estimate = deepseek_v41_residency_estimate(
+                    model_info.get("model_path", "")
+                )
+                if getattr(settings, "moe_expert_offload_enabled", False):
+                    entry = engine_pool.get_entry(model_id)
+                    if entry is not None:
+                        _, _, adjusted = engine_pool._deepseek_v41_engram_offload_status(
+                            entry, settings, ceiling=residency_ceiling
+                        )
+                        if adjusted is not None:
+                            estimate = adjusted
+                deepseek_v41_engram_ssd_offload_supported = estimate.supported
+                deepseek_v41_engram_ssd_offload_forced = estimate.force_ssd_offload(
+                    residency_ceiling
+                )
+                v41_resident_bytes = estimate.resident_bytes
+                v41_mmap_bytes = estimate.mmap_bytes
+            except (KeyError, OSError, TypeError, ValueError):
+                logger.debug(
+                    "Could not inspect DeepSeek V4.1 Engram residency for %s",
                     model_id,
                     exc_info=True,
                 )
@@ -2101,19 +2210,28 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
+            "distributed": model_info.get("distributed", False),
+            "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "moe_expert_offload_supported": moe_offload_supported,
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
+            "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
+            "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
+            "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
+
+        model_data.update(_model_options(model_data, settings))
 
         # Add settings if available
         if settings:
@@ -2442,6 +2560,13 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    if "deepseek_v41_engram_ssd_offload" in sent:
+        is_deepseek_v41 = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41"
+        current_settings.deepseek_v41_engram_ssd_offload = bool(
+            request.deepseek_v41_engram_ssd_offload and is_deepseek_v41
+        )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -2490,29 +2615,19 @@ async def update_model_settings(
             True if request.turboquant_skip_last is None
             else bool(request.turboquant_skip_last)
         )
-    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
-    # controls; the runtime signature below causes a loaded model to be
-    # re-created when the user applies a changed profile.
+    # Shared load-time ANE controls. Model metadata selects limits and backend.
+    ane_backend = ane_prefill_backend(entry.config_model_type)
     if "qwen35_ane_prefill_enabled" in sent:
-        enabled = bool(request.qwen35_ane_prefill_enabled)
-        config_type = str(getattr(entry, "config_model_type", "") or "")
-        config_type = config_type.lower().replace("-", "_")
-        if enabled and not config_type.startswith(
-            ("qwen3_5", "qwen3_6", "qwen3_8")
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
-            )
-        current_settings.qwen35_ane_prefill_enabled = enabled
+        current_settings.qwen35_ane_prefill_enabled = bool(
+            request.qwen35_ane_prefill_enabled
+        )
     if "qwen35_ane_prefill_sequence_length" in sent:
         value = request.qwen35_ane_prefill_sequence_length
-        if value is None or value < 1024 or value % 64:
+        if value is None:
             raise HTTPException(
-                status_code=400,
-                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+                status_code=400, detail="ANE prompt block cannot be null."
             )
-        current_settings.qwen35_ane_prefill_sequence_length = int(value)
+        current_settings.qwen35_ane_prefill_sequence_length = value
         if (
             current_settings.qwen35_ane_prefill_tail_padding_min_tokens
             >= int(value)
@@ -2533,13 +2648,14 @@ async def update_model_settings(
             )
         current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
     if "qwen35_ane_prefill_fraction" in sent:
-        value = request.qwen35_ane_prefill_fraction
-        if value is None or not 0.05 <= value <= 0.90:
-            raise HTTPException(
-                status_code=400,
-                detail="MLP ANE fraction must be between 0.05 and 0.90.",
-            )
-        current_settings.qwen35_ane_prefill_fraction = float(value)
+        current_settings.qwen35_ane_prefill_fraction = (
+            request.qwen35_ane_prefill_fraction
+        )
+    if "qwen35_ane_prefill_shared_fraction" in sent:
+        value = request.qwen35_ane_prefill_shared_fraction
+        current_settings.qwen35_ane_prefill_shared_fraction = (
+            1.0 if value is None else value
+        )
     if "qwen35_ane_prefill_max_layers" in sent:
         value = request.qwen35_ane_prefill_max_layers
         if value is None or value < 1:
@@ -2613,9 +2729,25 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
+    # oQ mixed-bit QxA8 prefill. Load-time like the ANE controls above: the
+    # runtime signature re-creates a loaded model when this changes.
+    if "qwen35_oq_a8_enabled" in sent:
+        current_settings.qwen35_oq_a8_enabled = bool(request.qwen35_oq_a8_enabled)
+    if "qwen35_oq_a8_min_tokens" in sent:
+        value = request.qwen35_oq_a8_min_tokens
+        if value is None or value < 1:
+            raise HTTPException(
+                status_code=400,
+                detail="oQ A8 min tokens must be at least 1.",
+            )
+        current_settings.qwen35_oq_a8_min_tokens = int(value)
     if (
-        current_settings.qwen35_ane_prefill_fused_down
-        and current_settings.qwen35_ane_prefill_fraction > 0.50
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_fused_down
+        and ane_prefill_fraction(
+            current_settings.qwen35_ane_prefill_fraction, entry.config_model_type
+        )
+        > 0.50
     ):
         # The fused loader reuses the MLP fraction for the down projection and
         # rejects anything above 0.50 at enable time. Without this check the
@@ -2628,8 +2760,11 @@ async def update_model_settings(
             ),
         )
     if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
-        and current_settings.qwen35_ane_prefill_fraction
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_cpu_enabled
+        and ane_prefill_fraction(
+            current_settings.qwen35_ane_prefill_fraction, entry.config_model_type
+        )
         * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
         + current_settings.qwen35_ane_prefill_cpu_fraction
         >= 1.0
@@ -2643,7 +2778,8 @@ async def update_model_settings(
             ),
         )
     if (
-        current_settings.qwen35_ane_prefill_cpu_enabled
+        ane_backend == "qwen"
+        and current_settings.qwen35_ane_prefill_cpu_enabled
         and current_settings.qwen35_ane_prefill_gdn
         and current_settings.qwen35_ane_prefill_gdn_fraction
         + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
@@ -2652,6 +2788,17 @@ async def update_model_settings(
         raise HTTPException(
             status_code=400,
             detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
+    # MoE expert offload settings
+    if "moe_expert_offload_enabled" in sent:
+        current_settings.moe_expert_offload_enabled = (
+            request.moe_expert_offload_enabled or False
+        )
+    if "moe_expert_offload_resident_fraction" in sent:
+        current_settings.moe_expert_offload_resident_fraction = (
+            0.25
+            if request.moe_expert_offload_resident_fraction is None
+            else request.moe_expert_offload_resident_fraction
         )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
@@ -2914,6 +3061,7 @@ async def update_model_settings(
     if "guided_grammar" in sent:
         grammar = request.guided_grammar.strip() if request.guided_grammar else None
         current_settings.guided_grammar = grammar or None
+    _validate_model_settings(entry, current_settings.to_dict())
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
@@ -3157,6 +3305,64 @@ def _raise_if_alias_conflicts_exposed_profiles(
             )
 
 
+def _validate_model_settings(entry, settings):
+    from ..model_settings import validate_moe_expert_offload
+
+    try:
+        validate_moe_expert_offload(settings)
+        if settings.get("moe_expert_offload_enabled"):
+            from ..patches.moe_offload_compat import moe_offload_compatibility
+
+            supported, reason = moe_offload_compatibility(entry.model_path)
+            if not supported:
+                raise ValueError(reason)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    if "qwen35_oq_a8_min_tokens" in settings:
+        value = settings["qwen35_oq_a8_min_tokens"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise HTTPException(
+                status_code=400, detail="oQ A8 min tokens must be at least 1."
+            )
+    if settings.get("qwen35_oq_a8_enabled"):
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if not config_type.startswith(("qwen3_5", "qwen3_6", "qwen3_8")):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 models."
+                ),
+            )
+        if not _oq_a8_kernels_available():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "oQ A8 prefill needs the native Qwen3.5 prefill kernels and "
+                    "a Metal device with native INT8 tensor operations "
+                    "(M5-series or newer)."
+                ),
+            )
+        if settings.get("qwen35_ane_prefill_enabled"):
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
+            )
+    if any(key.startswith("qwen35_ane_prefill_") for key in settings):
+        try:
+            validate_ane_prefill(settings, entry.config_model_type)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    if entry.config_model_type == "k2_horizon":
+        from ..patches.k2_horizon import validate_chat_template_kwargs
+
+        kwargs = dict(settings.get("chat_template_kwargs") or {})
+        if settings.get("enable_thinking") is not None:
+            kwargs["enable_thinking"] = settings["enable_thinking"]
+        validate_chat_template_kwargs(kwargs)
+
+
 @router.get("/api/models/{model_id}/profiles")
 async def list_model_profiles(
     model_id: str,
@@ -3176,7 +3382,8 @@ async def create_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
+    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3220,7 +3427,8 @@ async def update_model_profile(
     from ..model_profiles import InvalidProfileNameError, filter_universal_fields
 
     mgr = _require_settings_manager()
-    _require_model(model_id)
+    entry = _require_model(model_id)
+    _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3279,7 +3487,11 @@ async def apply_model_profile(
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
     is_diffusion_model = _entry_is_diffusion_model(entry)
-    sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
+    def sanitizer(settings):
+        if is_diffusion_model:
+            _sanitize_diffusion_settings_dict(settings)
+        _validate_model_settings(entry, settings)
+
     try:
         applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
     except ValueError as e:
@@ -3709,6 +3921,9 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "mcp": {
             "config_path": global_settings.mcp.config_path,
             "expose_tools": global_settings.mcp.expose_tools,
+        },
+        "usage": {
+            "usage_history": global_settings.usage.usage_history,
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
@@ -4307,6 +4522,18 @@ async def update_global_settings(
     if request.mcp_expose_tools is not None:
         global_settings.mcp.expose_tools = request.mcp_expose_tools
         runtime_applied.append("mcp_expose_tools")
+
+    # Usage history recording is applied at runtime (no restart needed).
+    # Disabling flushes pending aggregates and leaves usage.sqlite3 in place.
+    if request.usage_history is not None:
+        global_settings.usage.usage_history = request.usage_history
+        from ..server_metrics import get_server_metrics
+
+        history = get_server_metrics().usage_history
+        if history is not None:
+            # Disabling flushes to SQLite; keep that off the event loop.
+            await asyncio.to_thread(history.set_enabled, request.usage_history)
+        runtime_applied.append("usage_history")
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
@@ -5005,6 +5232,44 @@ def _parse_commits_from_pyproject(pyproject_path, packages: dict[str, str]) -> d
     return commits
 
 
+def _distributed_runtime_cache_stats(engine) -> dict | None:
+    """Rank zero's telemetry cache counters as a runtime-cache row source.
+
+    Distributed engines own no local scheduler, so the paged hot/SSD stats do
+    not exist for them. What rank zero reports is its per-rank prompt cache
+    (in-memory LRU) and prompt-snapshot store — returned here under a
+    separate ``rank_prompt_cache`` key so callers never confuse it with the
+    tiered hot/SSD cache columns or aggregates.
+    """
+
+    get_live = getattr(engine, "get_live_metrics", None)
+    if not callable(get_live):
+        return None
+    try:
+        live = get_live()
+    except Exception:  # noqa: BLE001
+        logger.debug("cluster live metrics failed", exc_info=True)
+        return None
+    if live is None or live.get("stale"):
+        return None
+    metrics = live.get("metrics")
+    cache = metrics.get("cache") if isinstance(metrics, dict) else None
+    if not isinstance(cache, dict):
+        return None
+    return {
+        "rank_prompt_cache": {
+            "entries": int(cache.get("entries", 0) or 0),
+            "bytes": int(cache.get("bytes", 0) or 0),
+            "lookups": int(cache.get("lookups", 0) or 0),
+            "hits": int(cache.get("hits", 0) or 0),
+            "misses": int(cache.get("misses", 0) or 0),
+            "hit_rate": float(cache.get("hit_rate", 0.0) or 0.0),
+            "tokens_reused": int(cache.get("tokens_reused", 0) or 0),
+            "affinity": str(cache.get("affinity", "none")),
+        },
+    }
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -5098,6 +5363,12 @@ def _build_runtime_cache_observability(
                     exc,
                 )
                 continue
+
+        if not runtime_stats and model_info.get("cluster"):
+            # Distributed engines own no local scheduler; fall back to rank
+            # zero's telemetry cache counters (kept out of the tiered hot/SSD
+            # columns and aggregates — see _distributed_runtime_cache_stats).
+            runtime_stats = _distributed_runtime_cache_stats(entry.engine)
 
         if not runtime_stats:
             continue
@@ -5261,6 +5532,15 @@ def _build_runtime_cache_observability(
         if cache_rates:
             model_payload["cache_rates"] = cache_rates
 
+        rank_prompt_cache = runtime_stats.get("rank_prompt_cache")
+        if isinstance(rank_prompt_cache, dict):
+            # Label the row so the UI presents these as rank-local prompt
+            # cache/snapshot stats, never as the tiered hot/SSD cache. Every
+            # tiered numeric field above stays 0, so the hot-cache and SSD
+            # aggregates are unaffected.
+            model_payload["cache_tier"] = "rank-prompt-snapshot"
+            model_payload["rank_prompt_cache"] = rank_prompt_cache
+
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
         payload["total_size_bytes"] += model_payload["total_size_bytes"]
@@ -5309,6 +5589,26 @@ def _build_runtime_cache_observability(
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
     return payload
+
+
+@router.get("/api/usage")
+def get_usage_history(
+    range: Literal["today", "yesterday", "7d", "30d", "90d", "month"] = "today",
+    model: str = "",
+    include_details: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
+    """Local hourly serving history. Sync route keeps SQLite off the event loop."""
+    from ..server_metrics import get_server_metrics
+
+    history = get_server_metrics().usage_history
+    if history is None:
+        raise HTTPException(status_code=503, detail="Usage history unavailable")
+    try:
+        # Exact canonical IDs allow filtering historical models no longer loaded.
+        return history.query(range, model, include_details=include_details)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Usage history unavailable") from exc
 
 
 @router.get("/api/stats")
@@ -5469,6 +5769,28 @@ def _build_active_models_data() -> dict:
                 activity_requests = snapshot.get("active_requests", 0)
                 activities = snapshot.get("activities", [])
 
+        # Cluster (distributed) engines own no local scheduler or collectors;
+        # their live stats come from rank zero's telemetry marker instead.
+        cluster_live = None
+        if (
+            model_info.get("cluster")
+            and entry is not None
+            and entry.engine is not None
+        ):
+            get_live = getattr(entry.engine, "get_live_metrics", None)
+            if callable(get_live):
+                try:
+                    cluster_live = get_live()
+                except Exception:  # noqa: BLE001
+                    logger.debug("cluster live metrics failed", exc_info=True)
+        # A stale marker proves nothing about the ranks' current state; show
+        # the model as idle rather than repeating outdated rates.
+        cluster_metrics = (
+            cluster_live["metrics"]
+            if cluster_live is not None and not cluster_live.get("stale")
+            else None
+        )
+
         prefilling = tracker.get_model_progress(model_id)
         prefilling_ids = {p["request_id"] for p in prefilling}
         if has_scheduler_snapshot:
@@ -5478,6 +5800,10 @@ def _build_active_models_data() -> dict:
         if has_scheduler_snapshot or collector_request_ids:
             active_requests = len(active_request_ids)
         active_requests += activity_requests
+        if cluster_metrics is not None:
+            # Rank zero's count is the only live source for distributed rows.
+            rank_active = cluster_metrics.get("active_requests", 0)
+            active_requests = int(rank_active) if isinstance(rank_active, int) else 0
 
         # Generating = active requests that finished prefill.
         generating = []
@@ -5504,6 +5830,40 @@ def _build_active_models_data() -> dict:
                     "max_tokens": getattr(req, "max_tokens", None) if req else None,
                 }
             )
+
+        if cluster_metrics is not None:
+            # Synthesize scheduler-shaped prefill/generate rows from rank
+            # zero's most recent request sample so the existing sub-row
+            # rendering applies unchanged.
+            last = cluster_metrics.get("last_request")
+            if isinstance(last, dict) and last.get("status") == "running":
+                progress = last.get("prefill_progress")
+                if isinstance(progress, dict) and progress.get("active"):
+                    prefilling.append(
+                        {
+                            "request_id": "rank0",
+                            "processed": progress.get("processed", 0),
+                            "total": progress.get("total", 0),
+                            "speed": progress.get("speed", 0.0),
+                            "eta": progress.get("eta"),
+                            "elapsed": progress.get("elapsed"),
+                            "detail": "cluster prefill",
+                        }
+                    )
+                elif last.get("decode_tps"):
+                    generating.append(
+                        {
+                            "request_id": "rank0",
+                            "elapsed_seconds": last.get("elapsed_seconds"),
+                            "generated_tokens": last.get("completion_tokens", 0),
+                            "tokens_per_second": last.get("decode_tps", 0.0),
+                            "last_activity_age_seconds": cluster_live.get(
+                                "age_seconds"
+                            ),
+                            "prompt_tokens": last.get("prompt_tokens", 0),
+                            "max_tokens": None,
+                        }
+                    )
 
         loading_started_at = model_info.get("loading_started_at")
         loading_elapsed_seconds = (
@@ -5606,6 +5966,11 @@ def _build_active_models_data() -> dict:
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
                 "dflash": dflash_info,
+                "cluster": (
+                    {**model_info["cluster"], "live": cluster_live}
+                    if model_info.get("cluster")
+                    else None
+                ),
             }
         )
 
@@ -6989,7 +7354,7 @@ async def start_ane_tuning(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    """Tune the model’s ANE/GPU split without changing persisted settings."""
     from .accuracy_benchmark import get_queue_status
     from .ane_tuning import (
         ANETuningRequest,
@@ -7049,6 +7414,7 @@ async def start_ane_tuning(
             detail=f"Model {tuning_request.model_id} is not a supported language model",
         )
 
+    tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
     run.task = asyncio.create_task(run_tuning(run, engine_pool))
@@ -7082,6 +7448,8 @@ async def cancel_ane_tuning(
         raise HTTPException(
             status_code=400, detail=f"ANE tuning is not running ({run.status})"
         )
+    if run.phase == "cleaning_up":
+        return {"status": "cleaning_up", "tuning_id": tuning_id}
     if run.task is not None and not run.task.done():
         run.task.cancel()
     return {"status": "cancelled", "tuning_id": tuning_id}

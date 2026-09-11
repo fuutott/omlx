@@ -1518,6 +1518,27 @@ def _remap_tool_call_names(
             tc.function.name = target
 
 
+def _parse_k2_tool_calls(
+    text: str, tools: Optional[List] = None
+) -> Tuple[str, Optional[List[ToolCall]]]:
+    """Keep malformed IFM output as text, like the shared XML fallback."""
+    from ..patches.k2_horizon.tool_parser import parse_tool_groups
+
+    try:
+        cleaned_text, parsed = parse_tool_groups(text, tools)
+        tool_calls = [
+            _build_tool_call(call["name"], call["arguments"]) for call in parsed
+        ]
+        if any(call is None for call in tool_calls):
+            raise ValueError("K2 Horizon tool-call arguments failed validation")
+    except (ValueError, TypeError, AttributeError, KeyError, *_DEEP_NEST_ERRORS) as exc:
+        logger.warning(
+            "K2 Horizon tool parsing failed; returning generated text: %s", exc
+        )
+        return text, None
+    return cleaned_text, tool_calls or None
+
+
 def parse_tool_calls(
     text: str,
     tokenizer: Any,
@@ -1546,8 +1567,15 @@ def parse_tool_calls(
         - cleaned_text: Text with tool call tags and thinking tags removed
         - tool_calls: List of ToolCall objects, or None if no tool calls found
     """
+    if getattr(tokenizer, "tool_call_start", None) == "<ifm|tool_calls>":
+        cleaned_text, tool_calls = _parse_k2_tool_calls(text, tools)
+        cleaned_text = re.sub(
+            r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
+        ).strip()
+        return cleaned_text, tool_calls or None
+
     cleaned_text, tool_calls = _parse_tool_calls_impl(text, tokenizer, tools)
-    if tool_calls:
+    if tool_calls and getattr(tokenizer, "tool_call_start", None) != "<｜DSML｜ calls>":
         _remap_tool_call_names(tool_calls, tools)
     return cleaned_text, tool_calls
 
@@ -1740,6 +1768,9 @@ def sanitize_tool_call_markup(text: str, tokenizer: Any) -> str:
     """Remove tool-call control markup while preserving surrounding prose."""
     if not text:
         return ""
+    if getattr(tokenizer, "tool_call_start", None) == "<｜DSML｜ calls>":
+        # V4.1 requires calls after </think>; reasoning is opaque text.
+        return text.strip()
 
     # Every caller sanitizes thinking-channel text; keep it byte-identical
     # with the streamed reasoning deltas, which do not consume DeepSeek
@@ -1788,7 +1819,11 @@ def extract_tool_calls_with_thinking(
     cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
     tool_calls_from_thinking = False
 
-    if not tool_calls and thinking_content:
+    if (
+        not tool_calls
+        and thinking_content
+        and getattr(tokenizer, "tool_call_start", None) != "<｜DSML｜ calls>"
+    ):
         _, tool_calls = parse_tool_calls(thinking_content, tokenizer, tools)
         tool_calls_from_thinking = bool(tool_calls)
 
@@ -1876,6 +1911,8 @@ class ToolCallStreamFilter:
 
     Suppression is envelope-bounded: control markup is removed, then visible
     prose after a closed envelope continues streaming normally.
+    IFM groups are validated together at EOF; their suffix stays buffered so
+    a malformed attempt can be returned intact instead of partially hidden.
 
     Args:
         tokenizer: The model's tokenizer. Uses tokenizer-defined
@@ -1903,6 +1940,9 @@ class ToolCallStreamFilter:
     ):
         marker = getattr(tokenizer, "tool_call_start", None)
         marker_end = getattr(tokenizer, "tool_call_end", None)
+        self._opaque_reasoning = (
+            not consume_dsml_separator and marker == "<｜DSML｜ calls>"
+        )
         # Normalize None-like values but preserve empty strings.
         if marker is None:
             marker = ""
@@ -1961,6 +2001,10 @@ class ToolCallStreamFilter:
         self._completed_envelope_overflowed = False
         self._capture_ordered_segments = bool(capture_ordered_segments)
         self._ordered_segments: List[ToolCallStreamSegment] = []
+        # IFM groups are parsed together at EOF. Hold from the first opener
+        # so failed parsing can return the exact suffix in its original order,
+        # including prose between groups, without repeating streamed content.
+        self._ifm_pending_parts: Optional[List[str]] = None
         self._reset_json_scan()
 
     @staticmethod
@@ -2014,7 +2058,11 @@ class ToolCallStreamFilter:
     def envelope_open(self) -> bool:
         """Whether model output is currently buffered inside a tool envelope."""
 
-        return bool(self._suppressing or self._suppressing_until is not None)
+        return bool(
+            self._suppressing
+            or self._suppressing_until is not None
+            or self._ifm_pending_parts is not None
+        )
 
     def _record_content(self, out: List[str], text: str) -> None:
         if not text:
@@ -2593,7 +2641,12 @@ class ToolCallStreamFilter:
 
     def feed(self, text: str) -> str:
         """Feed a content delta, return the portion safe to emit."""
+        if self._opaque_reasoning:
+            return text
         if self._suppressing or not text:
+            return ""
+        if self._ifm_pending_parts is not None:
+            self._ifm_pending_parts.append(text)
             return ""
         if not self.active:
             return text
@@ -2647,6 +2700,10 @@ class ToolCallStreamFilter:
                         self._sanitize_prefix_before_suppression(self._buffer[:idx])
                     )
                 self._buffer = self._buffer[idx + consume_len :]
+                if close_marker == "</ifm|tool_calls>":
+                    self._ifm_pending_parts = [opening_marker, self._buffer]
+                    self._buffer = ""
+                    break
                 if close_marker is not None:
                     self._suppressing_until = close_marker
                     if close_marker != "__suppress_permanently__":
@@ -2680,6 +2737,13 @@ class ToolCallStreamFilter:
         In clean-output strict mode, unresolved marker-like suffixes are dropped
         so partial control markup does not leak into user-visible text.
         """
+        if self._opaque_reasoning:
+            return ""
+        if self._ifm_pending_parts is not None:
+            raw = "".join(self._ifm_pending_parts)
+            self._ifm_pending_parts = None
+            cleaned, _ = _parse_k2_tool_calls(raw)
+            return cleaned
         if self._suppressing:
             self._buffer = ""
             self._suppressing_until = None

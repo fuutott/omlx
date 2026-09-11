@@ -47,7 +47,10 @@ _MAX_PLAN_BYTES = 256 * 1024
 
 # Rank-environment defaults carried by the mlx launch hostfile. Each value
 # yields to the coordinator's own environment: an operator who pinned a knob
-# keeps their value, and everyone else gets the tuned default.
+# keeps their value, and everyone else gets the default.
+#
+# Match MLX's disabled fast-sync default: fast fences can deadlock across
+# CPU/GPU streams (https://github.com/ml-explore/mlx/pull/4005).
 #
 # MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER bound how much work lands in
 # one Metal command buffer. An unbounded buffer overruns the GPU driver's
@@ -63,7 +66,7 @@ _MAX_PLAN_BYTES = 256 * 1024
 # wheel ships compiled defaults; pinning them here keeps the posture explicit
 # and identical across every rank.
 _RANK_ENV_DEFAULTS = (
-    ("MLX_METAL_FAST_SYNCH", "1"),
+    ("MLX_METAL_FAST_SYNCH", "0"),
     ("MLX_MAX_OPS_PER_BUFFER", "16"),
     ("MLX_MAX_MB_PER_BUFFER", "512"),
     ("JACCL_PROGRESS_TIMEOUT_MS", "30000"),

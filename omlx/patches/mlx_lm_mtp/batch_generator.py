@@ -1247,7 +1247,13 @@ def _set_singleton_mrope_delta(gen_batch: Any) -> None:
         import mlx.core as mx
 
         delta = model._uid_rope_deltas.get(uids[0], 0.0)
-        model.set_batch_rope_deltas(mx.array([delta]))
+        # uid-aware seam keeps a text-proven request on Qwen4's rank-two
+        # positions for the verify window (gathered-QSA eligibility).
+        step_setter = getattr(type(model), "set_step_rope_deltas", None)
+        if callable(step_setter):
+            step_setter(model, mx.array([delta]), list(uids))
+        else:
+            model.set_batch_rope_deltas(mx.array([delta]))
 
 
 def _rebuild_singleton_cache(model: Any) -> Optional[List[Any]]:
@@ -2496,13 +2502,19 @@ def _post_init_mtp(gen_batch: Any) -> None:
         state.depth = depth
         state.head_clone = head_clone
         if depth > 1:
-            state.controller = _DepthController(
-                depth,
-                marginal_ms=getattr(
-                    gen_batch.model, "_omlx_mtp_marginal_ms", None
-                ),
-                exit_margin=_effective_loop_tax(gen_batch.model),
+            factory = getattr(
+                _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
             )
+            if factory is not None:
+                state.controller = factory(depth)
+            else:
+                state.controller = _DepthController(
+                    depth,
+                    marginal_ms=getattr(
+                        gen_batch.model, "_omlx_mtp_marginal_ms", None
+                    ),
+                    exit_margin=_effective_loop_tax(gen_batch.model),
+                )
         primed = _prompt_priming.take_primed(
             gen_batch.model, gen_batch.prompt_cache, main_tok
         )

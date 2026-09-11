@@ -24,9 +24,12 @@ from unittest.mock import MagicMock, call, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import CacheList, KVCache
 
 import omlx.scheduler as scheduler_module
 from omlx.cache.stats import PrefixCacheStats
+from omlx.models.vlm import VLMModelAdapter
+from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
 from omlx.scheduler import (
     Scheduler,
@@ -3060,6 +3063,37 @@ class TestSchedulerBoundarySnapshots:
         assert args[0] == "req-reasoning"
         assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8]  # prompt only
 
+    def test_cleanup_finished_stores_output_tokens_when_reasoning_is_preserved(
+        self, mock_model, mock_tokenizer
+    ):
+        """A reasoning request whose history keeps the <think> output caches prompt + output."""
+        config = SchedulerConfig(paged_cache_block_size=4)
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.paged_cache_manager = None
+
+        request = Request(
+            request_id="req-reasoning-kept",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+            preserve_reasoning=True,
+        )
+        request.prompt_token_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+        request.num_prompt_tokens = 8
+        request.output_token_ids = [9, 10, 11, 12]
+        request.needs_think_prefix = True
+        request._extracted_cache = [{"state": "cache"}]
+        request._model_cache_config = None
+
+        scheduler.running["req-reasoning-kept"] = request
+        scheduler.requests["req-reasoning-kept"] = request
+
+        scheduler._cleanup_finished({"req-reasoning-kept"})
+
+        scheduler.block_aware_cache.store_cache.assert_called_once()
+        args, kwargs = scheduler.block_aware_cache.store_cache.call_args
+        assert args[1] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
     def test_cleanup_finished_stores_output_tokens_for_non_reasoning_model(
         self, mock_model, mock_tokenizer
     ):
@@ -3335,6 +3369,30 @@ class TestSchedulerBoundarySnapshots:
         assert (
             scheduler._boundary_cache_snapshots[request.request_id][4] == snapshot_cache
         )
+        assert scheduler._boundary_snapshot_required is True
+        assert mock_model._omlx_mtp_commit_align == 4
+
+    def test_add_request_arms_mtp_boundary_alignment_before_decode(
+        self, mock_model, mock_tokenizer
+    ):
+        """A prompt shorter than a block meets its first boundary mid-decode, so the
+        MTP commit alignment must be armed at admission, not at the first capture."""
+        RotatingStub = type("RotatingKVCache", (), {})
+        mock_model.make_cache = lambda: [RotatingStub()]
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.block_aware_cache = MagicMock()
+        request = Request(
+            request_id="req-short-prompt",
+            prompt="hello",
+            sampling_params=SamplingParams(),
+        )
+
+        scheduler.add_request(request)
+
         assert scheduler._boundary_snapshot_required is True
         assert mock_model._omlx_mtp_commit_align == 4
 
@@ -3646,6 +3704,36 @@ class TestSchedulerRotatingBlockAlignment:
 
 class TestSchedulerArraysCacheBlockAlignment:
     """ArraysCache boundaries must match the effective prefill chunk."""
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_deepseek_v41_subclass_uses_2048_boundaries(
+        self, mock_tokenizer, tmp_path, nested
+    ):
+        model = self._hybrid_model(model_type="deepseek_v41")
+        model.make_cache = lambda: [
+            CacheList(KVCache(), DeepseekV41Cache(4))
+            if nested
+            else DeepseekV41Cache(4)
+        ]
+        scheduler = Scheduler(
+            model=model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(
+                paged_ssd_cache_dir=str(tmp_path),
+                paged_cache_block_size=256,
+                prefill_step_size=2048,
+            ),
+        )
+        try:
+            assert scheduler._model_has_arrays_cache()
+            assert scheduler._qwen35_prefill_floor == 0
+            assert scheduler.config.paged_cache_block_size == 2048
+            assert scheduler._prefill_step_size_for_progress(0, 9216) == 2048
+        finally:
+            scheduler.shutdown()
+
+    def test_plain_kv_cache_is_not_arrays_cache(self):
+        assert not Scheduler._cache_tree_has_arrays_cache(KVCache())
 
     @staticmethod
     def _hybrid_model(model_type="qwen3_5"):
@@ -7048,6 +7136,24 @@ class TestSupportsSkipLmHead:
         assert scheduler._supports_skip_lm_head() is True
         # Result is cached on the instance.
         assert scheduler._skip_lm_head_supported is True
+
+    @pytest.mark.parametrize(
+        "model_type, expected", [("deepseek_v41", False), ("qwen4_exp", True)]
+    )
+    def test_vlm_capability_controls_prefill_skip_and_log(
+        self, model_type, expected, caplog
+    ):
+        adapter = VLMModelAdapter(
+            SimpleNamespace(
+                config=SimpleNamespace(model_type=model_type),
+                language_model=SimpleNamespace(),
+            )
+        )
+        scheduler = self._scheduler_with_model(adapter)
+        with caplog.at_level("INFO", logger="omlx.scheduler"):
+            assert scheduler._supports_skip_lm_head() is expected
+            assert scheduler._supports_skip_lm_head() is expected
+        assert caplog.text.count("Prefill lm_head skip enabled") == int(expected)
 
     def test_rejects_stock_model(self):
         class StockModel:

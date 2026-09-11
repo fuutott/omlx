@@ -1,4 +1,4 @@
-"""Apple Silicon equality gates for the opt-in CPU-batched PLE gather."""
+"""Apple Silicon equality gates for upstream batched PLE versus reference."""
 
 import json
 
@@ -52,9 +52,11 @@ def test_batched_ple_matches_reference_exactly(tmp_path, bits):
         for invalid in (-1, 10):
             with pytest.raises(IndexError):
                 embedding(mx.array([invalid]))
-        if bits in (None, "mixed"):
-            assert embedding._uniform_affine is None
+        import numpy as np
+        plan = embedding._plan(np.array([0, 4, 9], dtype=np.int64))
+        if bits == "mixed":
+            assert plan is None
         else:
-            assert embedding._uniform_affine[:2] == (bits, 32)
+            assert plan is not None and plan[-2] == bits
     finally:
         embedding.close()

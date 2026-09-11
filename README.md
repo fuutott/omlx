@@ -21,10 +21,21 @@ format, not the T5 language-model family. It is about 1.875 bits/weight includin
 stored scale/bias overhead for the gate/up expert matrices, **not the whole model**.
 No AngelSlim checkout is needed to run this converter.
 
-Status, **2026-09-08**: the weight-only prefix-fit/Q8-PLE checkpoint has run on
+Status, **2026-09-11**: this sync branch incorporates upstream
+`b390b31e0c6831225fed0f24d278eb1db7fcb68b` (0.7.0.dev2), including Qwen4 PLE
+prefetch/batched uploads, long-context QSA row gathering, and experimental
+expert SSD offload. **Native validation of this merge is blocked by a local
+SDK/linker mismatch; it has not replaced the validated serving build.** The
+expert-offload adapter rejects this fork's uint8-packed T5 experts; do not
+enable it for T5 checkpoints or claim a new memory saving. Its affine-model
+support is separate from PLE offload. MLX remains pinned to 0.32.2. See
+[sync notes](docs/experimental/qwen4_upstream_sync_20260911.md).
+
+The weight-only prefix-fit/Q8-PLE checkpoint has run on
 the target Mac, but quantization loss remains and speed depends on the workload.
-We are validating an upstream runtime merge at `4c2b05e4` (MLX 0.32.2); its Mac
-results are pending. Do not interpret structural checks as proof of quality,
+The preceding native c85c35ff build was tested on the target Mac, including a
+T5/imatrix/Q3-down candidate; those results do not validate this new merge.
+Do not interpret structural checks as proof of quality,
 losslessness or a guaranteed throughput. The Unsloth importance matrix is now applied
 through a verified tensor mapping (DeltaNet `out_proj` un-permuted) and measured by
 KL divergence against a Q8_0 teacher: on wikitext-2 the weight-only T5 bake scores
@@ -190,6 +201,13 @@ environment, full Xcode/Metal tools, and build with `OMLX_WITH_CUSTOM_KERNEL=1`.
 Current dependencies include MLX 0.32.2; rebuild native extensions after dependency
 changes and verify `native_kernel_status()` before loading. Stock oMLX release
 install instructions below are not a substitute for this experimental build.
+
+On this sync branch, PLE batched uploads and next-chunk prefetch use upstream's
+implementation by default. `OMLX_QWEN4_PLE_BATCHED_GATHER=0` retains a synchronous
+per-shard reference path for comparisons; it does not disable SSD offload.
+Do not enable MoE expert offload on a Bonsai T5 bake: upstream's header-only
+eligibility check requires supported quantization and uint32-packed weights.
+No new full-model performance or accuracy result exists for this merged build.
 
 Keep an existing mainline installation untouched: use the isolated environment's
 executable, separate server settings/base path and an unused port. Confirm PLE
@@ -479,7 +497,7 @@ One-click benchmarking from the admin panel. Measures prefill (PP) and text gene
 
 ### macOS Menubar App
 
-Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
+Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the server without opening a terminal. Includes [local usage history](docs/usage-analytics.md) with per-model totals and an hourly heatmap, persistent serving stats (survives restarts), auto-restart on crash, and built-in auto-update.
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
@@ -500,7 +518,7 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 
 ### Tool Calling & Structured Output
 
-Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected via mlx-lm's built-in tool parsers:
+Supports all function calling formats available in mlx-lm, JSON schema validation, and MCP tool integration. Tool calling requires the model's chat template to support the `tools` parameter. The following model families are auto-detected:
 
 | Model Family | Format |
 |---|---|
@@ -510,6 +528,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |
 | Mistral | `[TOOL_CALLS]` |
+| IFM K2 Horizon | XML or JSON inside `<ifm\|tool_calls>`. Requires `omlx[grammar]` |
 | Kimi K2 | `<\|tool_calls_section_begin\|>` |
 | Longcat | `<longcat_tool_call>` |
 

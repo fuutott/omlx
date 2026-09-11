@@ -62,6 +62,8 @@ struct StatusScreen: View {
                                   comment: "Header label above average serving speed metrics"))
             AverageSpeedTilesRow(stats: vm.stats)
 
+            UsageHistoryView()
+
             SectionHeader(String(localized: "status.section.active_now",
                                   defaultValue: "Active Now",
                                   comment: "Section header for the currently active models list"))
@@ -487,8 +489,8 @@ private struct SystemRamTrailing: View {
         guard let used = metrics.ramUsedBytes,
               let total = metrics.ramTotalBytes
         else { return "—" }
-        let u = SystemMetricsPoller.formatBytesAsGB(used)
-        let t = SystemMetricsPoller.formatBytesAsGB(total)
+        let u = SystemMetricsPoller.formatBytesAsGiB(used)
+        let t = SystemMetricsPoller.formatBytesAsGiB(total)
         return "\(u) / \(t) GB"
     }
 }

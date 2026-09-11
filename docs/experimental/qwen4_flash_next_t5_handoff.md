@@ -1,5 +1,12 @@
 # Qwen3.8-Flash-Next T5 handoff
 
+Sync candidate (2026-09-11): see [upstream sync notes](qwen4_upstream_sync_20260911.md).
+Upstream b390b31e (0.7.0.dev2) is merged in a separate candidate checkout.
+Native build is blocked by the local SDK/linker mismatch; no native/runtime
+success or server cutover is claimed. T5 expert offload remains unsupported.
+PLE batching now uses upstream's implementation by default; the old explicit
+zero switch selects a synchronous reference. Previous serving builds are intact.
+
 Integration update (2026-09-08): the upstream merge incorporates
 `94530d8d49541ede9e99ef04a4431ee4953117a6` and includes the Mac fixes through
 `0820cfc96eefcea20d156b7058ea05cda5810c11`. By user decision, fused HC now
