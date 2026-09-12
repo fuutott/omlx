@@ -1,5 +1,10 @@
 # Qwen4 T5 + Q8 MTP candidate
 
+> **Historical document.** The Q8 MTP head described here was tested on the Mac
+> on 2026-09-08 and 2026-09-09: about 75 % draft acceptance, little end-to-end
+> gain, and several GiB of extra swap on 48 GB, so the released checkpoint ships
+> without it. The tool remains available for experiments.
+
 User decision (2026-09-08): restore the original one-layer MTP head at Q8.
 Keep the measured prefix-fit T5 target, Q8 SSD PLE, tokenizer and template
 unchanged. No imatrix, new runtime optimization or KV-cache quantization work.
@@ -38,11 +43,12 @@ MTP stripping or overwrite any existing output directory.
 Use the existing isolated Windows CUDA environment, with explicit HF_HOME:
 
 ```powershell
-$env:HF_HOME = 'D:\hf_models_cache'
+$env:HF_HOME = 'D:\hf-cache'  # your SSD-backed HF_HOME
+$qwenSource = Join-Path $env:HF_HOME 'hub\models--Qwen--Qwen3.8-Flash-Next\snapshots\de4b8e4d43b917e7706784d8bb445c9af86a3540'
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/add_qwen4_mtp_q8.py `
-  --source D:/hf_models_cache/hub/models--Qwen--Qwen3.8-Flash-Next/snapshots/de4b8e4d43b917e7706784d8bb445c9af86a3540 `
-  --base D:/hf_models_cache/artifacts/Qwen3.8-Flash-Next-MLX-t5-prefix-ple8-0a21f3d8 `
-  --output D:/hf_models_cache/artifacts/Qwen3.8-Flash-Next-MLX-t5-prefix-ple8-mtp8
+  --source $qwenSource `
+  --base (Join-Path $env:HF_HOME 'artifacts\qwen4-t5-prefix-ple8') `
+  --output (Join-Path $env:HF_HOME 'artifacts\qwen4-t5-prefix-ple8-mtp8')
 ```
 
 The same script's `--verify-only --base BASE --output CANDIDATE` checks the

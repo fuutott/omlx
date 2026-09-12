@@ -6,11 +6,54 @@
 
 ## This fork: Qwen Flash Next on a 48 GB Mac
 
-This branch, `qwen4-flash-next-t5`, explores running **Qwen3.8-Flash-Next on a
-48 GB M3 Max** using low-bit routed experts and SSD-backed PLE n-gram embeddings.
-It is an experimental fork of oMLX, not an upstream release or a general-purpose
-Qwen quantizer. The model identifies as `qwen4_exp`: its hyper-connections,
-DeltaNet/QSA layers and PLE layout must not be treated as Qwen3.5.
+This fork runs **Qwen3.8-Flash-Next on a 48 GB M3 Max** using low-bit routed
+experts and SSD-backed PLE n-gram embeddings. It is an experimental fork of oMLX,
+not an upstream release or a general-purpose Qwen quantizer. The model identifies
+as `qwen4_exp`: its hyper-connections, DeltaNet/QSA layers and PLE layout must not
+be treated as Qwen3.5. Development happens on `main`.
+
+**Released checkpoint:**
+[fuutott/Qwen3.8-Flash-Next-MLX-t5-imatrix-q3down-ple8](https://huggingface.co/fuutott/Qwen3.8-Flash-Next-MLX-t5-imatrix-q3down-ple8)
+(about 35.6 GiB resident, 38 tok/s decode, 64K-token requests on the M3 Max).
+Its model card carries the measured memory, speed, KL-divergence and benchmark
+numbers; the recipe below is how it was made.
+
+### What changed against upstream oMLX, where, and why
+
+- **Ternary (Bonsai T5) routed experts for `qwen4_exp`.** Where:
+  `omlx/custom_kernels/bonsai/` (new `affine_gather_qmv_fast_t5` Metal kernel and
+  `BonsaiT5GatherQmvPrimitive`), `omlx/patches/bonsai_t5_load.py`,
+  `omlx/patches/qwen35_moe_gate_up.py`, `omlx/patches/m5_gather_qmm.py`,
+  `omlx/utils/model_loading.py`. Why: the routed gate/up banks are stored at about
+  1.875 bits/weight as rank-3 T5 tensors, which stock loaders reject and stock
+  `gather_qmm` cannot read; the `omlx_t5` config marker switches the loader and
+  dispatcher over, and the dispatcher chain is walked so the T5 and M5 reroutes
+  cannot recurse on reload.
+- **PLE n-gram table served from SSD.** Where:
+  `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/ple_mmap.py`
+  (new) and `language.py`. Why: the 53.6 GiB Q8 embedding table must never be
+  resident on a 48 GB machine, so rows are gathered through `mmap` per token.
+  The current integration uses upstream batched uploads and prefetch by default;
+  `OMLX_QWEN4_PLE_BATCHED_GATHER=0` selects the synchronous reference path.
+- **Converter and bake tooling.** Where: `tools/quantize_qwen4_flash_next_t5.py`
+  (T5 or affine expert formats, Q2/Q3 down, importance-weighted range search,
+  verify and resume), `tools/qwen4_flash_next_imatrix.py` (llama.cpp GGUF imatrix
+  importer, including the DeltaNet `out_proj` un-permute), `tools/add_qwen4_mtp_q8.py`
+  (optional Q8 MTP head), `tools/t5_to_affine.py` (lossless T5 to affine re-pack so
+  T5 bakes can be scored on stock kernels), `tools/qwen4_flash_next_quant.{in,lock}`.
+  Why: bake and verify checkpoints on a Windows/CUDA host without touching the Mac.
+- **Measurement tools.** Where: `tools/qwen4_flash_next_eval.py` and its corpus
+  (12-prompt API smoke), `tools/qwen4_ple_bench.py` (PLE gather timing),
+  `tools/qwen4_t5_fit_bench.py` (fitter error on real weights). Why: keep quality
+  and speed claims measured rather than inferred.
+- **Chat UI streaming fix.** Where: `omlx/admin/templates/chat.html`. Why: the
+  streamed-answer repaint handle was reactive, so clearing it re-scheduled paints
+  at display refresh rate with no new tokens; paints are now coalesced to 5 Hz by
+  a timer held outside Alpine's reactivity.
+- **Tests and docs.** Where: `tests/test_qwen4_*`, `tests/test_bonsai_*`,
+  `tests/test_chat_render_scheduling.py`, `tools/tests/`, `docs/experimental/qwen4_*.md`.
+  Why: converter tests run anywhere; native Metal numerics are tested on the Mac;
+  the docs record the handoff, runtime tuning, fitter correctness and MTP notes.
 
 There are two separate workstreams: creating better compact weights, and making
 the native MLX/Metal runtime faster without changing those weights. The starting
@@ -21,7 +64,7 @@ format, not the T5 language-model family. It is about 1.875 bits/weight includin
 stored scale/bias overhead for the gate/up expert matrices, **not the whole model**.
 No AngelSlim checkout is needed to run this converter.
 
-Status, **2026-09-12**: this sync branch incorporates upstream
+Runtime status, **2026-09-12**: this fork incorporates upstream
 `b390b31e0c6831225fed0f24d278eb1db7fcb68b` (0.7.0.dev2), including Qwen4 PLE
 prefetch/batched uploads, long-context QSA row gathering, and experimental
 expert SSD offload. **Native build and 428 focused tests now pass on M3 Max
@@ -35,24 +78,27 @@ enable it for T5 checkpoints or claim a new memory saving. Its affine-model
 support is separate from PLE offload. MLX remains pinned to 0.32.2. See
 [sync notes](docs/experimental/qwen4_upstream_sync_20260911.md).
 
-The weight-only prefix-fit/Q8-PLE checkpoint has run on
-the target Mac, but quantization loss remains and speed depends on the workload.
-The preceding native c85c35ff build was tested on the target Mac, including a
-T5/imatrix/Q3-down candidate; those results do not validate this new merge.
-Do not interpret structural checks as proof of quality,
-losslessness or a guaranteed throughput. The Unsloth importance matrix is now applied
-through a verified tensor mapping (DeltaNet `out_proj` un-permuted) and measured by
-KL divergence against a Q8_0 teacher: on wikitext-2 the weight-only T5 bake scores
-mean KLD 0.69, T5 with imatrix 0.57, affine Q2 with imatrix 0.48, Unsloth UD-Q4_K_XL
-0.036. The earlier unusable imatrix bake predates the mapping fix and the
-prefix fitter. Optional Q8 MTP is also experimental:
-prior native tests diverged from ordinary greedy decoding, so keep MTP disabled
-for baseline use. KV-cache quantization is left to upstream.
+Released checkpoint evidence, **2026-09-09** (predates this runtime sync):
+the released checkpoint (ternary + imatrix gate/up, Q3
+down, Q8 PLE on SSD, no MTP) has completed its validation on the target Mac with
+this fork built natively: about 35.6 GiB of resident weights, 41.5 GiB physical
+peak at 8K context with 1.8-2.5 GiB of one-off startup swap, 38 tok/s decode,
+64K+256-token chat requests, and a 129K-token prefill verified by oMLX's automatic
+context sizing. Quality against a Q8_0 teacher on wikitext-2: mean KLD 0.489
+(weight-only ternary 0.69, ternary + imatrix with Q2 down 0.57, affine Q2 +
+imatrix 0.48, Unsloth UD-Q4_K_XL 0.036). On a fixed 700-case MMLU/GSM8K/TruthfulQA/CMMLU
+subset it scores 587 (old weight-only ternary 578, Q4_K_XL 634); HumanEval 92.7 %,
+MBPP 78.0 % (Q4_K_XL 95.7 % / 85.8 %). Known regression: Chinese instruction
+following on strict-format prompts. The Unsloth importance matrix is applied
+through a verified tensor mapping (DeltaNet `out_proj` un-permuted). Optional Q8
+MTP remains research-only: it gave little on this hardware and cost several GiB
+of swap, so keep it disabled. KV-cache quantization is left to upstream.
 
 ### How to bake the cake
 
 These instructions create your own MLX safetensors checkpoint from the original
-source model. There are no links to our generated weights. Observe the source
+source model. The released checkpoint linked above was produced with exactly
+these steps. Observe the source
 model's license and access conditions; the runtime's license does not replace them.
 
 #### Ingredients and current recipe
@@ -72,19 +118,21 @@ not a GGUF or one self-contained file.
 
 | Component | Current conversion |
 | --- | --- |
-| Routed expert gate/up | Bonsai T5, group 128, guarded weight-only prefix fitting |
-| Routed expert down | MLX affine Q2, group 128 |
+| Routed expert gate/up | Bonsai T5, group 128, imatrix-weighted guarded prefix fitting |
+| Routed expert down | MLX affine Q3, group 128, imatrix range search (`--expert-down-bits 2` for the smaller Q2 variant) |
 | PLE n-gram embeddings | MLX affine Q8, group 32; 128 independently mmap-able shards |
 | Shared experts / shared-expert gate | Affine Q8, group 128 / 64 |
 | Token embeddings and LM head | Affine Q6, group 64 |
 | Attention/DeltaNet projections | Affine Q5, group 64; QSA `o_proj` remains Q4/group 64 |
 | Other eligible matrices | Affine Q4, group 64 |
-| Vision, MoE routers, norms, convolutions and recurrent parameters | Retain source precision (BF16 in the pinned source) |
+| Vision tower Linear layers | Affine Q8, group 64 (`--vision-bits 8`; `--vision-bits 0` keeps them BF16) |
+| MoE routers, norms, convolutions, recurrent parameters and the rest of the vision tower | Retain source precision (BF16 in the pinned source) |
 | MTP | Omitted from the baseline; optional separate Q8 addition below |
 
-The Q8-PLE output is approximately **86 GiB on disk**, including approximately
-54 GiB of PLE tensors intended for SSD mmap. The static offloaded model estimate
-is approximately 34 GiB; **that is not total process memory**. Activations, KV
+The Q3-down output is approximately **90 GiB on disk**, including approximately
+54 GiB of PLE tensors intended for SSD mmap; the Q2-down variant is about 86 GiB.
+Resident weights are about 35.6 GiB (Q3 down) or 30.9 GiB (Q2 down); **that is
+not total process memory**. Activations, KV
 cache, mmap working pages and runtime overhead still need headroom. PLE is kept
 at Q8 because its full table need not occupy unified memory. Do not reduce it to
 Q2 just to shrink an SSD-resident file.
@@ -96,7 +144,7 @@ Step 2b describes the stock-oMLX variant with affine experts instead of T5.
 PowerShell, in a new checkout (adjust the SSD path first):
 
 ```powershell
-git clone --branch qwen4-flash-next-t5 https://github.com/fuutott/omlx.git omlx-qwen48
+git clone https://github.com/fuutott/omlx.git omlx-qwen48
 Set-Location omlx-qwen48
 git rev-parse HEAD  # Record this with your conversion results.
 
@@ -116,6 +164,10 @@ uv tool install huggingface_hub
 # If authentication is needed: hf auth login (never put tokens in this README).
 hf download Qwen/Qwen3.8-Flash-Next --revision $qwenRevision --cache-dir $env:HF_HUB_CACHE
 hf cache verify Qwen/Qwen3.8-Flash-Next --revision $qwenRevision --cache-dir $env:HF_HUB_CACHE --fail-on-missing-files
+
+# Unsloth's importance matrix for this model; both recipes below use it.
+hf download unsloth/Qwen3.8-Flash-Next-GGUF imatrix_unsloth.gguf_file --cache-dir $env:HF_HUB_CACHE
+$imatrix = Get-ChildItem (Join-Path $env:HF_HUB_CACHE 'models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots') -Recurse -Filter imatrix_unsloth.gguf_file | Select-Object -First 1 -ExpandProperty FullName
 ```
 
 Stop on any command failure. On Windows, enabling Developer Mode permits HF
@@ -129,7 +181,7 @@ project's MLX dependencies. The commands below deliberately use `--no-project`.
 uv run --no-project --python .venv/Scripts/python.exe python -B -m unittest discover -s tools/tests -v
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --self-test --device cuda:0
 
-uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenOutput --ple-bits 8 --t5-fitter prefix --device cuda:0 --chunk-rows 4096 --imatrix $imatrix --imatrix-strict --allow-experimental-imatrix --clip-search --vision-bits 8
+uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenOutput --ple-bits 8 --t5-fitter prefix --device cuda:0 --chunk-rows 4096 --imatrix $imatrix --imatrix-strict --allow-experimental-imatrix --clip-search --vision-bits 8 --expert-down-bits 3
 
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --verify-only $qwenOutput
 ```
@@ -137,8 +189,9 @@ uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_q
 Use a fresh output directory. After an interruption, rerun the **same conversion
 command** with `--resume`; the manifest must match source, converter, recipe and
 environment. A changed recipe/code/chunk size needs a new directory. `$imatrix` is
-the Unsloth file downloaded in step 2b; omit the imatrix flags to reproduce the
-historical weight-only bake. `--t5-fitter legacy` and `--ple-bits 2` are historical
+the Unsloth file downloaded in step 1; omit the imatrix flags to reproduce the
+historical weight-only bake, and omit `--expert-down-bits 3` for the 30.9 GiB
+Q2-down variant. `--t5-fitter legacy` and `--ple-bits 2` are historical
 controls only.
 
 Keep `omlx_conversion.json`, `omlx_conversion_manifest.json`, the Git SHA and
@@ -168,8 +221,7 @@ vision tower cannot be dropped entirely because the runtime always builds it and
 loads weights strictly.
 
 ```powershell
-hf download unsloth/Qwen3.8-Flash-Next-GGUF imatrix_unsloth.gguf_file --cache-dir $env:HF_HUB_CACHE
-$imatrix = Get-ChildItem (Join-Path $env:HF_HUB_CACHE 'models--unsloth--Qwen3.8-Flash-Next-GGUF\snapshots') -Recurse -Filter imatrix_unsloth.gguf_file | Select-Object -First 1 -ExpandProperty FullName
+# $qwenSource and $imatrix come from step 1.
 $qwenAffineOutput = Join-Path $env:HF_HOME 'artifacts\qwen4-affine-q2-imatrix-ple8'
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --model $qwenSource --output $qwenAffineOutput --expert-format affine --imatrix $imatrix --imatrix-strict --vision-bits 8 --device cuda:0 --chunk-rows 4096
 uv run --no-project --python .venv/Scripts/python.exe python -B tools/quantize_qwen4_flash_next_t5.py --verify-only $qwenAffineOutput
