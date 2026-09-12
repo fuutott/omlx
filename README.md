@@ -25,9 +25,11 @@ Status, **2026-09-12**: this sync branch incorporates upstream
 `b390b31e0c6831225fed0f24d278eb1db7fcb68b` (0.7.0.dev2), including Qwen4 PLE
 prefetch/batched uploads, long-context QSA row gathering, and experimental
 expert SSD offload. **Native build and 428 focused tests now pass on M3 Max
-using Xcode 27 RC with its installed Metal Toolchain. Full-model generation,
-memory and speed validation remain pending; this merge has not replaced the
-validated serving build.** The
+using Xcode 27 RC with its installed Metal Toolchain. A small same-checkpoint
+smoke produced readable English/Chinese at 36.9–37.2 decode tok/s; two uncached
+2K prompts measured 353–372 prefill and 35.0–43.8 decode tok/s. Peak physical
+footprint was 41.5 GiB, with substantial system swap activity during loading.
+This is not a broad quality verdict or a controlled old/new speed comparison.** The
 expert-offload adapter rejects this fork's uint8-packed T5 experts; do not
 enable it for T5 checkpoints or claim a new memory saving. Its affine-model
 support is separate from PLE offload. MLX remains pinned to 0.32.2. See

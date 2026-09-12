@@ -3,8 +3,9 @@
 Sync candidate (2026-09-11): see [upstream sync notes](qwen4_upstream_sync_20260911.md).
 Upstream b390b31e (0.7.0.dev2) is merged in a separate candidate checkout.
 September 12: Xcode 27 RC with its installed Metal Toolchain builds all native
-extensions successfully; 428 focused tests pass with no skips. Full-model
-generation, memory and speed checks remain pending; no server cutover occurred.
+extensions successfully; 428 focused tests pass with no skips. A subsequent
+isolated small smoke produced readable English/Chinese and completed two
+uncached 2K prefill probes; see sync notes for rates and the startup swap caveat.
 T5 expert offload remains unsupported, confirmed against actual model headers.
 PLE batching now uses upstream's implementation by default; the old explicit
 zero switch selects a synchronous reference. Previous serving builds are intact.

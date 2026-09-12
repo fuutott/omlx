@@ -92,7 +92,34 @@ this merge. The existing experimental checkout and global helper are unchanged;
 the system-default Xcode selection is unchanged. Raw build/status/test logs
 are retained outside Git in the workspace runtime results directory.
 
-Next step: validate the same
+## Subsequent small full-model smoke
+
+At runtime commit 1725cd53862214f62b912e5a352490b848172d3f, the user authorized
+a small test server. Strict loading confirmed 96 T5 banks, 48 Q3 down modules,
+no MTP head/weights, forced PLE mmap and native Bonsai dispatch. First logits
+were finite. Context 8192, native 16-bit QSA KV, MTP/thinking off, existing safe
+48 GiB guard; no weight or mainline changes.
+
+English generated 128 tokens at 37.22 decode tok/s; Chinese stopped naturally
+after 111 tokens at 36.87 tok/s. Both gave 1473–1543 and readable on-topic prose.
+Two exactly 2048-input/256-output requests, with a minute between them, measured
+353.34/372.25 prefill tok/s and 35.04/43.76 decode tok/s. Both had zero cached
+tokens and identical output text. Token caps truncated English and maintenance
+summaries; this is a narrow coherence smoke, not a general quality score.
+
+Physical footprint peaked at 41.5 GiB (37.7 GiB after requests); MLX peak was
+39.55 GiB. Whole-machine swap peaked at 9.87 GiB during loading from an initial
+0.74 GiB; brief critical pressure did not reach the unchanged sustained stop
+threshold. This was not swap-free. Whole-machine I/O increased by 55.23 GB read
+and 17.75 GB write including loading/swap, not model-exclusive PLE throughput.
+No guard abort recorded; a prefill soft-budget warning did occur.
+
+The isolated smoke server was subsequently stopped at the user's request;
+the server and monitor exited and port 18080 was verified free. No old/new same-session A/B,
+long-context test, MTP test or broad quality evaluation was performed.
+Raw prompts/outputs and metrics remain outside Git in the local runtime report.
+
+For further validation, use the same
 checkpoint serially with SSD PLE, existing memory guard, short EN/ZH and bounded
 prefill before any serving cutover. Never load both full models at once on48GB.
 Retain raw old/new outputs, errors, memory/swap and timings; do not infer the
