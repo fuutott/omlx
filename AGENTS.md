@@ -10,6 +10,14 @@ in an isolated checkout/environment and report the exact upstream revision and
 what was tested. Never modify the user's separate mainline installation as part
 of this workflow. This convention does not authorize background syncs.
 
+`jundot/omlx` main takes priority for engine architecture, behavior and
+optimizations. Keep the extra runtime delta limited to T5 loading, native
+kernels and necessary compatibility, supported by tests and bake tooling.
+Prefer upstream implementations when they improve or supersede local work;
+do not retain unrelated local optimizations merely because they are ours.
+Review obsolete deltas for removal and validate replacements. A push-only or
+documentation task is not a reason to silently strip untested runtime code.
+
 Read `docs/experimental/qwen4_flash_next_t5_handoff.md` before changing or
 testing the Qwen3.8-Flash-Next work in this fork.
 
