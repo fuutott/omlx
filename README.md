@@ -21,11 +21,13 @@ format, not the T5 language-model family. It is about 1.875 bits/weight includin
 stored scale/bias overhead for the gate/up expert matrices, **not the whole model**.
 No AngelSlim checkout is needed to run this converter.
 
-Status, **2026-09-11**: this sync branch incorporates upstream
+Status, **2026-09-12**: this sync branch incorporates upstream
 `b390b31e0c6831225fed0f24d278eb1db7fcb68b` (0.7.0.dev2), including Qwen4 PLE
 prefetch/batched uploads, long-context QSA row gathering, and experimental
-expert SSD offload. **Native validation of this merge is blocked by a local
-SDK/linker mismatch; it has not replaced the validated serving build.** The
+expert SSD offload. **Native build and 428 focused tests now pass on M3 Max
+using Xcode 27 RC with its installed Metal Toolchain. Full-model generation,
+memory and speed validation remain pending; this merge has not replaced the
+validated serving build.** The
 expert-offload adapter rejects this fork's uint8-packed T5 experts; do not
 enable it for T5 checkpoints or claim a new memory saving. Its affine-model
 support is separate from PLE offload. MLX remains pinned to 0.32.2. See
