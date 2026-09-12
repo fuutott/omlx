@@ -1,5 +1,20 @@
 # Qwen4 upstream sync candidate — 2026-09-11
 
+September 12 follow-up: integrated upstream
+991b8912a23e6641034526a412d4805a5c10935e after the original sync was published.
+Commits 36493634, 395ec2fd and 991b8912 add DeepSeek V4.1 CED prefill, settings
+and cache/reload support. The shared unload settle barrier additionally waits
+for the physical footprint ledger to catch up. No Qwen4/Bonsai kernel or
+dependency changes; no extra native rebuild needed. The merge was conflict-free.
+
+355 tests passed, with zero skips/failures, in fresh processes: engine pool
+(158), VLM adapter (44), expert offload compatibility (17), DeepSeek CED (7),
+DeepSeek SSD (24), DeepSeek core (48), T5 load (42), gate/up (15). All 14 changed
+Python files parsed, dashboard JavaScript syntax passed, chat scheduling test
+passed, and diff whitespace checks passed. Logs are retained outside Git as
+`latest-test_*.log`. Full-model timings below belong to the previous tested
+integration, not a repeated run after this follow-up. Server remains stopped.
+
 Baseline: c85c35ffbf24f83a085538266f3942eb68c43c1a.
 Upstream: b390b31e0c6831225fed0f24d278eb1db7fcb68b, version0.7.0.dev2.
 This is a separate candidate, not a validated replacement for the serving build.

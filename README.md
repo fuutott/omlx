@@ -65,7 +65,7 @@ stored scale/bias overhead for the gate/up expert matrices, **not the whole mode
 No AngelSlim checkout is needed to run this converter.
 
 Runtime status, **2026-09-12**: this fork incorporates upstream
-`b390b31e0c6831225fed0f24d278eb1db7fcb68b` (0.7.0.dev2), including Qwen4 PLE
+`991b8912a23e6641034526a412d4805a5c10935e` (0.7.0.dev2), including Qwen4 PLE
 prefetch/batched uploads, long-context QSA row gathering, and experimental
 expert SSD offload. **Native build and 428 focused tests now pass on M3 Max
 using Xcode 27 RC with its installed Metal Toolchain. A small same-checkpoint
@@ -77,6 +77,10 @@ expert-offload adapter rejects this fork's uint8-packed T5 experts; do not
 enable it for T5 checkpoints or claim a new memory saving. Its affine-model
 support is separate from PLE offload. MLX remains pinned to 0.32.2. See
 [sync notes](docs/experimental/qwen4_upstream_sync_20260911.md).
+The measurements above were taken at the preceding b390b31e integration;
+the three subsequent upstream DeepSeek CED/shared-loading commits passed 355
+regression tests. They do not change Qwen4 or native kernels; full-model smoke
+was not repeated after that follow-up merge.
 
 Released checkpoint evidence, **2026-09-09** (predates this runtime sync):
 the released checkpoint (ternary + imatrix gate/up, Q3

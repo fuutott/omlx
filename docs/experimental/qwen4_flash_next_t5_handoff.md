@@ -1,7 +1,9 @@
 # Qwen3.8-Flash-Next T5 handoff
 
 Sync candidate (2026-09-11): see [upstream sync notes](qwen4_upstream_sync_20260911.md).
-Upstream b390b31e (0.7.0.dev2) is merged in a separate candidate checkout.
+Upstream 991b8912 (0.7.0.dev2) is integrated; the model smoke below was run at
+the preceding b390b31e integration. The three-commit follow-up passed 355
+regression tests without a new full-model run (see sync notes).
 September 12: Xcode 27 RC with its installed Metal Toolchain builds all native
 extensions successfully; 428 focused tests pass with no skips. A subsequent
 isolated small smoke produced readable English/Chinese and completed two
